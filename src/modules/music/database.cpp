@@ -10,6 +10,7 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <unordered_set>
 
 namespace bot::module::music {
 
@@ -18,7 +19,7 @@ MusicDatabase::MusicDatabase(const std::string& db_path)
 {}
 
 MusicDatabase::~MusicDatabase() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (db_) {
         sqlite3_close(db_);
         db_ = nullptr;
@@ -26,7 +27,7 @@ MusicDatabase::~MusicDatabase() {
 }
 
 bool MusicDatabase::init() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (sqlite3_open(db_path_.c_str(), &db_) != SQLITE_OK) {
         std::cerr << "[MusicDatabase] Failed to open SQLite DB: " << sqlite3_errmsg(db_) << std::endl;
         return false;
@@ -122,6 +123,17 @@ bool MusicDatabase::init() {
             created_at INTEGER NOT NULL,
             PRIMARY KEY (group_id, eval_date)
         );
+
+        CREATE TABLE IF NOT EXISTS group_netease_accounts (
+            group_id INTEGER PRIMARY KEY,
+            source_group_id INTEGER NOT NULL,
+            cookie TEXT NOT NULL DEFAULT '',
+            nickname TEXT DEFAULT '',
+            account_uid INTEGER DEFAULT 0,
+            is_vip INTEGER DEFAULT 0,
+            recommend_slot INTEGER DEFAULT 0,
+            updated_at INTEGER NOT NULL
+        );
     )";
 
     char* err_msg = nullptr;
@@ -129,6 +141,46 @@ bool MusicDatabase::init() {
         std::cerr << "[MusicDatabase] Schema init error: " << (err_msg ? err_msg : "unknown") << std::endl;
         sqlite3_free(err_msg);
         return false;
+    }
+
+    // 增量迁移：为 group_netease_accounts 添加 recommend_slot 字段
+    sqlite3_exec(db_, "ALTER TABLE group_netease_accounts ADD COLUMN recommend_slot INTEGER DEFAULT 0;", nullptr, nullptr, nullptr);
+
+    // 针对现在已经登录的网易云账号，把它变成 1022206916 这个群的网易云音乐账号
+    {
+        bool has_1022206916 = false;
+        sqlite3_stmt* acc_check_stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT 1 FROM group_netease_accounts WHERE group_id = 1022206916;", -1, &acc_check_stmt, nullptr) == SQLITE_OK) {
+            if (sqlite3_step(acc_check_stmt) == SQLITE_ROW) {
+                has_1022206916 = true;
+            }
+            sqlite3_finalize(acc_check_stmt);
+        }
+
+        if (!has_1022206916) {
+            std::string cookie;
+            sqlite3_stmt* cfg_stmt = nullptr;
+            if (sqlite3_prepare_v2(db_, "SELECT value FROM bot_configs WHERE key = 'netease_cookie';", -1, &cfg_stmt, nullptr) == SQLITE_OK) {
+                if (sqlite3_step(cfg_stmt) == SQLITE_ROW) {
+                    const char* val = reinterpret_cast<const char*>(sqlite3_column_text(cfg_stmt, 0));
+                    if (val) cookie = val;
+                }
+                sqlite3_finalize(cfg_stmt);
+            }
+
+            if (!cookie.empty() && cookie.find("MUSIC_U") != std::string::npos) {
+                int64_t now_ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                sqlite3_stmt* ins_stmt = nullptr;
+                const char* ins_sql = "INSERT INTO group_netease_accounts (group_id, source_group_id, cookie, updated_at) VALUES (1022206916, 1022206916, ?, ?);";
+                if (sqlite3_prepare_v2(db_, ins_sql, -1, &ins_stmt, nullptr) == SQLITE_OK) {
+                    sqlite3_bind_text(ins_stmt, 1, cookie.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int64(ins_stmt, 2, now_ts);
+                    sqlite3_step(ins_stmt);
+                    sqlite3_finalize(ins_stmt);
+                    std::cout << "[MusicDatabase] Auto-migrated global netease_cookie to group 1022206916." << std::endl;
+                }
+            }
+        }
     }
 
     // 确保代码中的硬性管理员写入数据库
@@ -241,7 +293,7 @@ bool MusicDatabase::init() {
 }
 
 bool MusicDatabase::add_subscription(int64_t group_id, int64_t artist_id, const std::string& artist_name, const std::string& platform, const std::string& pic_url) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = R"(
@@ -276,7 +328,7 @@ bool MusicDatabase::add_subscription(int64_t group_id, int64_t artist_id, const 
 }
 
 bool MusicDatabase::update_artist_pic_url(int64_t artist_id, const std::string& pic_url, const std::string& platform, int64_t updated_at) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     if (updated_at <= 0) {
@@ -308,7 +360,7 @@ bool MusicDatabase::update_artist_pic_url(int64_t artist_id, const std::string& 
 }
 
 bool MusicDatabase::remove_subscription(int64_t group_id, const std::string& artist_name, const std::string& platform) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = platform.empty()
@@ -333,7 +385,7 @@ bool MusicDatabase::remove_subscription(int64_t group_id, const std::string& art
 }
 
 bool MusicDatabase::remove_subscription_by_id(int64_t group_id, int64_t artist_id, const std::string& platform) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = platform.empty()
@@ -358,7 +410,7 @@ bool MusicDatabase::remove_subscription_by_id(int64_t group_id, int64_t artist_i
 }
 
 std::vector<ArtistSubscription> MusicDatabase::find_subscriptions(int64_t group_id, const std::string& artist_name, const std::string& platform) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<ArtistSubscription> result;
     if (!db_) return result;
 
@@ -397,7 +449,7 @@ std::vector<ArtistSubscription> MusicDatabase::find_subscriptions(int64_t group_
 }
 
 std::vector<ArtistSubscription> MusicDatabase::get_group_subscriptions(int64_t group_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<ArtistSubscription> result;
     if (!db_) return result;
 
@@ -429,7 +481,7 @@ std::vector<ArtistSubscription> MusicDatabase::get_group_subscriptions(int64_t g
 }
 
 std::vector<ArtistSubscription> MusicDatabase::get_all_unique_artists() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<ArtistSubscription> result;
     if (!db_) return result;
 
@@ -457,7 +509,7 @@ std::vector<ArtistSubscription> MusicDatabase::get_all_unique_artists() {
 }
 
 std::vector<int64_t> MusicDatabase::get_subscribers_for_artist(int64_t artist_id, const std::string& platform) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<int64_t> result;
     if (!db_) return result;
 
@@ -483,7 +535,7 @@ std::vector<int64_t> MusicDatabase::get_subscribers_for_artist(int64_t artist_id
 }
 
 std::vector<int64_t> MusicDatabase::get_subscribers_for_artist_name(const std::string& artist_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<int64_t> result;
     if (!db_) return result;
 
@@ -504,7 +556,7 @@ std::vector<int64_t> MusicDatabase::get_subscribers_for_artist_name(const std::s
 }
 
 bool MusicDatabase::is_subscribed(int64_t group_id, int64_t artist_id, const std::string& platform) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = platform.empty()
@@ -528,7 +580,7 @@ bool MusicDatabase::is_subscribed(int64_t group_id, int64_t artist_id, const std
 }
 
 bool MusicDatabase::is_song_pushed(int64_t song_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = "SELECT 1 FROM pushed_songs WHERE song_id = ? LIMIT 1;";
@@ -544,7 +596,7 @@ bool MusicDatabase::is_song_pushed(int64_t song_id) {
 }
 
 bool MusicDatabase::record_pushed_song(int64_t song_id, int64_t artist_id, const std::string& song_name, int64_t publish_time) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = R"(
@@ -573,7 +625,7 @@ bool MusicDatabase::record_pushed_song(int64_t song_id, int64_t artist_id, const
 }
 
 bool MusicDatabase::is_album_pushed(int64_t album_id, const std::string& platform) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = platform.empty()
@@ -595,7 +647,7 @@ bool MusicDatabase::is_album_pushed(int64_t album_id, const std::string& platfor
 
 bool MusicDatabase::record_pushed_album(int64_t album_id, int64_t artist_id, const std::string& album_name,
                                         int64_t publish_time, const std::string& platform, const std::string& artist_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = R"(
@@ -631,7 +683,7 @@ bool MusicDatabase::is_album_recently_pushed_cross_platform(const std::string& a
                                                              const std::string& album_name,
                                                              int64_t within_seconds,
                                                              const std::string& current_platform) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = R"(
@@ -673,7 +725,7 @@ bool MusicDatabase::is_album_recently_pushed_cross_platform(const std::string& a
 }
 
 bool MusicDatabase::has_artist_pushed_albums(int64_t artist_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = "SELECT 1 FROM pushed_albums WHERE artist_id = ? LIMIT 1;";
@@ -689,7 +741,7 @@ bool MusicDatabase::has_artist_pushed_albums(int64_t artist_id) {
 }
 
 bool MusicDatabase::set_config(const std::string& key, const std::string& value) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = "INSERT OR REPLACE INTO bot_configs (key, value, updated_at) VALUES (?, ?, ?);";
@@ -711,7 +763,7 @@ bool MusicDatabase::set_config(const std::string& key, const std::string& value)
 }
 
 std::string MusicDatabase::get_config(const std::string& key, const std::string& default_val) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return default_val;
 
     const char* sql = "SELECT value FROM bot_configs WHERE key = ?;";
@@ -735,7 +787,7 @@ std::string MusicDatabase::get_config(const std::string& key, const std::string&
 }
 
 bool MusicDatabase::set_daily_music_enabled(int64_t group_id, bool enabled) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = "INSERT OR REPLACE INTO daily_music_subscriptions (group_id, enabled, created_at) VALUES (?, ?, ?);";
@@ -757,7 +809,7 @@ bool MusicDatabase::set_daily_music_enabled(int64_t group_id, bool enabled) {
 }
 
 bool MusicDatabase::is_daily_music_enabled(int64_t group_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = "SELECT enabled FROM daily_music_subscriptions WHERE group_id = ?;";
@@ -778,7 +830,7 @@ bool MusicDatabase::is_daily_music_enabled(int64_t group_id) {
 }
 
 std::vector<int64_t> MusicDatabase::get_daily_music_groups() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<int64_t> groups;
     if (!db_) return groups;
 
@@ -799,7 +851,7 @@ std::vector<int64_t> MusicDatabase::get_daily_music_groups() {
 int64_t MusicDatabase::record_daily_push(const std::string& task_name, int64_t group_id, int64_t message_id,
                                         int64_t item_id, const std::string& item_name, const std::string& artist_name,
                                         const std::string& platform, const std::string& date, int64_t timestamp) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return -1;
 
     const char* sql = R"(
@@ -863,7 +915,7 @@ DailyPushedRecord parse_daily_pushed_row(sqlite3_stmt* stmt) {
 } // namespace
 
 std::optional<DailyPushedRecord> MusicDatabase::get_daily_push_by_message_id(int64_t message_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return std::nullopt;
 
     const char* sql = R"(
@@ -887,7 +939,7 @@ std::optional<DailyPushedRecord> MusicDatabase::get_daily_push_by_message_id(int
 }
 
 std::optional<DailyPushedRecord> MusicDatabase::get_latest_daily_push(int64_t group_id, const std::string& task_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return std::nullopt;
 
     sqlite3_stmt* stmt = nullptr;
@@ -922,7 +974,7 @@ std::optional<DailyPushedRecord> MusicDatabase::get_latest_daily_push(int64_t gr
 }
 
 std::optional<DailyPushedRecord> MusicDatabase::get_today_daily_push(int64_t group_id, const std::string& date) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return std::nullopt;
 
     std::string d = date;
@@ -962,7 +1014,7 @@ std::optional<DailyPushedRecord> MusicDatabase::get_today_daily_push(int64_t gro
 }
 
 std::vector<DailyPushedRecord> MusicDatabase::get_unevaluated_daily_pushes(const std::string& task_name) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<DailyPushedRecord> results;
     if (!db_) return results;
 
@@ -995,7 +1047,7 @@ std::vector<DailyPushedRecord> MusicDatabase::get_unevaluated_daily_pushes(const
 }
 
 bool MusicDatabase::mark_daily_push_evaluated(int64_t record_id, int upvotes, int downvotes) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = "UPDATE daily_pushed_records SET evaluated = 1, upvotes = ?, downvotes = ? WHERE id = ?;";
@@ -1014,7 +1066,7 @@ bool MusicDatabase::mark_daily_push_evaluated(int64_t record_id, int upvotes, in
 }
 
 bool MusicDatabase::record_daily_reaction(int64_t message_id, int64_t user_id, int reaction_type) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = "INSERT OR REPLACE INTO daily_reaction_records (message_id, user_id, reaction_type, created_at) VALUES (?, ?, ?, ?);";
@@ -1037,7 +1089,7 @@ bool MusicDatabase::record_daily_reaction(int64_t message_id, int64_t user_id, i
 }
 
 bool MusicDatabase::remove_daily_reaction(int64_t message_id, int64_t user_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = "DELETE FROM daily_reaction_records WHERE message_id = ? AND user_id = ?;";
@@ -1055,7 +1107,7 @@ bool MusicDatabase::remove_daily_reaction(int64_t message_id, int64_t user_id) {
 }
 
 bool MusicDatabase::clear_daily_reactions(int64_t message_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     sqlite3_stmt* stmt = nullptr;
@@ -1074,7 +1126,7 @@ bool MusicDatabase::clear_daily_reactions(int64_t message_id) {
 }
 
 bool MusicDatabase::is_daily_evaluated(int64_t group_id, const std::string& date) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     std::string d = date;
@@ -1115,7 +1167,7 @@ bool MusicDatabase::is_daily_evaluated(int64_t group_id, const std::string& date
 }
 
 bool MusicDatabase::set_daily_evaluated(int64_t group_id, const std::string& date) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     std::string d = date;
@@ -1151,7 +1203,7 @@ bool MusicDatabase::set_daily_evaluated(int64_t group_id, const std::string& dat
 }
 
 bool MusicDatabase::clear_daily_push_records(int64_t group_id, const std::string& date) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     std::string sql = "DELETE FROM daily_pushed_records WHERE 1=1";
@@ -1169,7 +1221,7 @@ bool MusicDatabase::clear_daily_push_records(int64_t group_id, const std::string
 }
 
 bool MusicDatabase::clear_daily_evaluation(int64_t group_id, const std::string& date) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     std::string sql = "DELETE FROM daily_eval_records WHERE 1=1";
@@ -1204,7 +1256,7 @@ bool MusicDatabase::reset_daily_push_status(int64_t group_id, const std::string&
 
     // 1. 获取该群当日推送的所有消息 ID，并清空对应的表情投票记录
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
         if (db_) {
             const char* sql = "SELECT message_id FROM daily_pushed_records WHERE group_id = ? AND pushed_date = ?;";
             sqlite3_stmt* stmt = nullptr;
@@ -1239,8 +1291,65 @@ bool MusicDatabase::reset_daily_push_status(int64_t group_id, const std::string&
     return true;
 }
 
+DailyMusicTimeConfig MusicDatabase::get_daily_music_time_config() {
+    DailyMusicTimeConfig cfg;
+    cfg.push_hour = 9;
+    cfg.push_minute = 0;
+    cfg.eval_hour = 23;
+    cfg.eval_minute = 40;
+    cfg.update_hour = 6;
+    cfg.update_minute = 0;
+
+    auto push_str = get_config("daily_music_push_time");
+    if (!push_str.empty()) {
+        int h = 0, m = 0;
+        if (std::sscanf(push_str.c_str(), "%d:%d", &h, &m) == 2 && h >= 0 && h <= 23 && m >= 0 && m <= 59) {
+            cfg.push_hour = h;
+            cfg.push_minute = m;
+        }
+    }
+
+    auto eval_str = get_config("daily_music_eval_time");
+    if (!eval_str.empty()) {
+        int h = 0, m = 0;
+        if (std::sscanf(eval_str.c_str(), "%d:%d", &h, &m) == 2 && h >= 0 && h <= 23 && m >= 0 && m <= 59) {
+            cfg.eval_hour = h;
+            cfg.eval_minute = m;
+        }
+    }
+
+    auto update_str = get_config("daily_music_update_time");
+    if (!update_str.empty()) {
+        int h = 0, m = 0;
+        if (std::sscanf(update_str.c_str(), "%d:%d", &h, &m) == 2 && h >= 0 && h <= 23 && m >= 0 && m <= 59) {
+            cfg.update_hour = h;
+            cfg.update_minute = m;
+        }
+    }
+
+    return cfg;
+}
+
+bool MusicDatabase::set_daily_push_time(int hour, int minute) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d", hour, minute);
+    return set_config("daily_music_push_time", buf);
+}
+
+bool MusicDatabase::set_daily_eval_time(int hour, int minute) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d", hour, minute);
+    return set_config("daily_music_eval_time", buf);
+}
+
+bool MusicDatabase::set_daily_update_time(int hour, int minute) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d", hour, minute);
+    return set_config("daily_music_update_time", buf);
+}
+
 std::pair<int, int> MusicDatabase::get_daily_push_votes(int64_t message_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return {0, 0};
 
     // 若该条消息已结算，直接从 daily_pushed_records 获取保存的结算投票数据
@@ -1306,7 +1415,7 @@ bool MusicDatabase::is_admin(int64_t user_id) {
     if (is_hardcoded_admin(user_id)) {
         return true;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = "SELECT 1 FROM bot_admins WHERE user_id = ? LIMIT 1;";
@@ -1322,7 +1431,7 @@ bool MusicDatabase::is_admin(int64_t user_id) {
 }
 
 bool MusicDatabase::add_admin(int64_t user_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = "INSERT OR IGNORE INTO bot_admins (user_id, created_at) VALUES (?, ?);";
@@ -1346,7 +1455,7 @@ bool MusicDatabase::remove_admin(int64_t user_id) {
     if (is_hardcoded_admin(user_id)) {
         return false; // 硬性管理员不可被移除
     }
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = "DELETE FROM bot_admins WHERE user_id = ?;";
@@ -1362,7 +1471,7 @@ bool MusicDatabase::remove_admin(int64_t user_id) {
 }
 
 std::vector<int64_t> MusicDatabase::get_admins() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<int64_t> admins;
     for (int64_t id : g_hardcoded_admins) {
         admins.push_back(id);
@@ -1390,7 +1499,7 @@ bool MusicDatabase::has_any_admin() {
     if (!g_hardcoded_admins.empty()) {
         return true;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
     const char* sql = "SELECT 1 FROM bot_admins LIMIT 1;";
@@ -1402,6 +1511,291 @@ bool MusicDatabase::has_any_admin() {
     bool exists = (sqlite3_step(stmt) == SQLITE_ROW);
     sqlite3_finalize(stmt);
     return exists;
+}
+
+int MusicDatabase::allocate_account_slot(int64_t account_uid, int64_t group_id, int max_slots) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!db_ || account_uid <= 0) return 0;
+
+    const char* sql = "SELECT recommend_slot FROM group_netease_accounts WHERE account_uid = ? AND group_id != ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_int64(stmt, 1, account_uid);
+    sqlite3_bind_int64(stmt, 2, group_id);
+
+    std::unordered_set<int> used_slots;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        used_slots.insert(sqlite3_column_int(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+
+    // 检查是否已达到最大群聊绑定上限 (35)
+    if (static_cast<int>(used_slots.size()) >= max_slots) {
+        return -1;
+    }
+
+    // 线性探测法寻找最小未被占用的槽位 (0..max_slots-1)
+    for (int slot = 0; slot < max_slots; ++slot) {
+        if (used_slots.find(slot) == used_slots.end()) {
+            return slot;
+        }
+    }
+
+    return -1;
+}
+
+bool MusicDatabase::set_group_netease_account(int64_t group_id, const std::string& cookie,
+                                             const std::string& nickname, int64_t account_uid,
+                                             bool is_vip, int recommend_slot) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!db_ || group_id <= 0) return false;
+
+    int64_t now_ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    const char* sql = R"(
+        INSERT INTO group_netease_accounts (group_id, source_group_id, cookie, nickname, account_uid, is_vip, recommend_slot, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(group_id) DO UPDATE SET
+            source_group_id = excluded.source_group_id,
+            cookie = excluded.cookie,
+            nickname = excluded.nickname,
+            account_uid = excluded.account_uid,
+            is_vip = excluded.is_vip,
+            recommend_slot = excluded.recommend_slot,
+            updated_at = excluded.updated_at;
+    )";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+
+    sqlite3_bind_int64(stmt, 1, group_id);
+    sqlite3_bind_int64(stmt, 2, group_id); // 自持账号 source_group_id = group_id
+    sqlite3_bind_text(stmt, 3, cookie.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, nickname.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 5, account_uid);
+    sqlite3_bind_int(stmt, 6, is_vip ? 1 : 0);
+    sqlite3_bind_int(stmt, 7, recommend_slot);
+    sqlite3_bind_int64(stmt, 8, now_ts);
+
+    bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool MusicDatabase::share_group_netease_account(int64_t dest_group, int64_t src_group, int recommend_slot) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!db_ || dest_group <= 0 || src_group <= 0) return false;
+
+    // 先查出 src_group 的 source_group_id 及 account_uid、nickname、is_vip
+    int64_t canonical_source = src_group;
+    std::string nick;
+    int64_t uid = 0;
+    bool vip = false;
+
+    auto src_acc = get_group_netease_account(src_group);
+    if (!src_acc.has_value()) {
+        return false; // src_group 不存在账号
+    }
+    canonical_source = src_acc->source_group_id > 0 ? src_acc->source_group_id : src_group;
+    nick = src_acc->nickname;
+    uid = src_acc->account_uid;
+    vip = src_acc->is_vip;
+
+    int64_t now_ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    const char* sql = R"(
+        INSERT INTO group_netease_accounts (group_id, source_group_id, cookie, nickname, account_uid, is_vip, recommend_slot, updated_at)
+        VALUES (?, ?, '', ?, ?, ?, ?, ?)
+        ON CONFLICT(group_id) DO UPDATE SET
+            source_group_id = excluded.source_group_id,
+            cookie = '',
+            nickname = excluded.nickname,
+            account_uid = excluded.account_uid,
+            is_vip = excluded.is_vip,
+            recommend_slot = excluded.recommend_slot,
+            updated_at = excluded.updated_at;
+    )";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+
+    sqlite3_bind_int64(stmt, 1, dest_group);
+    sqlite3_bind_int64(stmt, 2, canonical_source);
+    sqlite3_bind_text(stmt, 3, nick.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 4, uid);
+    sqlite3_bind_int(stmt, 5, vip ? 1 : 0);
+    sqlite3_bind_int(stmt, 6, recommend_slot);
+    sqlite3_bind_int64(stmt, 7, now_ts);
+
+    bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+std::optional<GroupNeteaseAccount> MusicDatabase::get_group_netease_account(int64_t group_id) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!db_ || group_id <= 0) return std::nullopt;
+
+    int64_t source_group_id = 0;
+    std::string direct_cookie;
+    std::string direct_nick;
+    int64_t direct_uid = 0;
+    bool direct_vip = false;
+    int direct_slot = 0;
+    int64_t updated_at = 0;
+    bool found = false;
+
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql1 = "SELECT source_group_id, cookie, nickname, account_uid, is_vip, recommend_slot, updated_at FROM group_netease_accounts WHERE group_id = ?;";
+    if (sqlite3_prepare_v2(db_, sql1, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, group_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            found = true;
+            source_group_id = sqlite3_column_int64(stmt, 0);
+            const char* c = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+            if (c) direct_cookie = c;
+            const char* n = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+            if (n) direct_nick = n;
+            direct_uid = sqlite3_column_int64(stmt, 3);
+            direct_vip = (sqlite3_column_int(stmt, 4) != 0);
+            direct_slot = sqlite3_column_int(stmt, 5);
+            updated_at = sqlite3_column_int64(stmt, 6);
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    if (!found) return std::nullopt;
+
+    if (source_group_id == group_id || source_group_id == 0) {
+        return GroupNeteaseAccount{
+            .group_id = group_id,
+            .source_group_id = group_id,
+            .cookie = direct_cookie,
+            .nickname = direct_nick,
+            .account_uid = direct_uid,
+            .is_vip = direct_vip,
+            .recommend_slot = direct_slot,
+            .updated_at = updated_at
+        };
+    }
+
+    sqlite3_stmt* src_stmt = nullptr;
+    const char* sql2 = "SELECT cookie, nickname, account_uid, is_vip, updated_at FROM group_netease_accounts WHERE group_id = ?;";
+    if (sqlite3_prepare_v2(db_, sql2, -1, &src_stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int64(src_stmt, 1, source_group_id);
+        if (sqlite3_step(src_stmt) == SQLITE_ROW) {
+            const char* c = reinterpret_cast<const char*>(sqlite3_column_text(src_stmt, 0));
+            std::string src_cookie = c ? c : "";
+            const char* n = reinterpret_cast<const char*>(sqlite3_column_text(src_stmt, 1));
+            std::string src_nick = n ? n : "";
+            int64_t src_uid = sqlite3_column_int64(src_stmt, 2);
+            bool src_vip = (sqlite3_column_int(src_stmt, 3) != 0);
+            int64_t src_updated = sqlite3_column_int64(src_stmt, 4);
+            sqlite3_finalize(src_stmt);
+
+            return GroupNeteaseAccount{
+                .group_id = group_id,
+                .source_group_id = source_group_id,
+                .cookie = src_cookie,
+                .nickname = direct_nick.empty() ? src_nick : direct_nick,
+                .account_uid = direct_uid > 0 ? direct_uid : src_uid,
+                .is_vip = direct_vip || src_vip,
+                .recommend_slot = direct_slot,
+                .updated_at = src_updated
+            };
+        }
+        sqlite3_finalize(src_stmt);
+    }
+
+    return std::nullopt;
+}
+
+bool MusicDatabase::clear_group_netease_account(int64_t group_id) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!db_ || group_id <= 0) return false;
+
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "DELETE FROM group_netease_accounts WHERE group_id = ?;";
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_int64(stmt, 1, group_id);
+    bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+std::vector<int64_t> MusicDatabase::get_groups_sharing_account(int64_t group_id) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::vector<int64_t> result;
+    if (!db_ || group_id <= 0) return result;
+
+    int64_t canonical_source = group_id;
+    sqlite3_stmt* src_stmt = nullptr;
+    const char* sql1 = "SELECT source_group_id FROM group_netease_accounts WHERE group_id = ?;";
+    if (sqlite3_prepare_v2(db_, sql1, -1, &src_stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int64(src_stmt, 1, group_id);
+        if (sqlite3_step(src_stmt) == SQLITE_ROW) {
+            int64_t s = sqlite3_column_int64(src_stmt, 0);
+            if (s > 0) canonical_source = s;
+        }
+        sqlite3_finalize(src_stmt);
+    }
+
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql2 = "SELECT group_id FROM group_netease_accounts WHERE group_id = ? OR source_group_id = ?;";
+    if (sqlite3_prepare_v2(db_, sql2, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, canonical_source);
+        sqlite3_bind_int64(stmt, 2, canonical_source);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            result.push_back(sqlite3_column_int64(stmt, 0));
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    if (result.empty()) {
+        result.push_back(group_id);
+    }
+    return result;
+}
+
+std::pair<int, int> MusicDatabase::get_shared_daily_push_votes(int64_t group_id, const std::string& date) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto shared_groups = get_groups_sharing_account(group_id);
+    int total_up = 0;
+    int total_down = 0;
+
+    for (int64_t gid : shared_groups) {
+        auto push_opt = get_today_daily_push(gid, date);
+        if (push_opt.has_value() && push_opt->message_id > 0) {
+            auto [up, down] = get_daily_push_votes(push_opt->message_id);
+            total_up += up;
+            total_down += down;
+        }
+    }
+    return {total_up, total_down};
+}
+
+std::vector<int64_t> MusicDatabase::get_all_known_groups() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::vector<int64_t> groups;
+    if (!db_) return groups;
+
+    const char* sql = "SELECT DISTINCT group_id FROM artist_subscriptions "
+                      "UNION SELECT DISTINCT group_id FROM daily_music_configs "
+                      "UNION SELECT DISTINCT group_id FROM group_netease_accounts;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            groups.push_back(sqlite3_column_int64(stmt, 0));
+        }
+        sqlite3_finalize(stmt);
+    }
+    return groups;
 }
 
 } // namespace bot::module::music

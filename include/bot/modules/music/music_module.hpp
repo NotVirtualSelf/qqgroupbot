@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <set>
 #include <mutex>
 #include <atomic>
 #include <boost/asio/io_context.hpp>
@@ -165,6 +166,19 @@ public:
      */
     static std::vector<bot::protocol::ForwardNode> build_album_forward_nodes(const AlbumDetail& album);
 
+    /**
+     * @brief 判断机器人是否在指定的 QQ 群中
+     * @param group_id QQ 群号
+     * @return bool 在群中返回 true
+     */
+    bool is_bot_in_group(int64_t group_id) const;
+
+    /**
+     * @brief 记录机器人所在的群号 (用于动态入群发现或外部注入)
+     * @param group_id QQ 群号
+     */
+    void add_known_group(int64_t group_id);
+
 private:
     struct AlbumPushItem {
         int64_t gid;
@@ -186,6 +200,7 @@ private:
 
     struct QrLoginSession {
         int64_t user_id{0};
+        int64_t target_group{0};
         std::string unikey;
         std::string png_path;
         int poll_count{0};
@@ -195,10 +210,17 @@ private:
         std::unique_ptr<boost::asio::steady_timer> timer;
     };
 
-    void start_qr_login_session(int64_t user_id);
+    void start_qr_login_session(int64_t user_id, int64_t target_group);
     void schedule_qr_poll();
     void on_qr_poll_timer(const boost::system::error_code& ec);
     void cancel_qr_login_session();
+
+    struct PendingShareConfirm {
+        int64_t user_id{0};
+        int64_t dest_group{0};
+        int64_t src_group{0};
+        std::chrono::steady_clock::time_point expire_at;
+    };
 
     boost::asio::io_context& ioc_;
     bot::protocol::RpcClient& rpc_client_;
@@ -215,6 +237,12 @@ private:
 
     mutable std::mutex pending_mutex_;
     std::unordered_map<int64_t, PendingSelection> pending_selections_; // group_id -> PendingSelection
+
+    mutable std::mutex shares_mutex_;
+    std::unordered_map<int64_t, PendingShareConfirm> pending_shares_; // user_id -> PendingShareConfirm
+
+    mutable std::mutex groups_mutex_;
+    std::set<int64_t> known_groups_;
 };
 
 } // namespace bot::module::music

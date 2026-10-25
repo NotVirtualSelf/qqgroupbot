@@ -1261,7 +1261,7 @@ int main() {
             assert(module.get_daily_manager().trigger_push_now("netease_daily_song", 8888));
             assert(sent_payloads.size() == 2);
             assert(sent_payloads[0].find("[CQ:music,type=163,id=186016]") != std::string::npos);
-            assert(sent_payloads[1].find("当日音乐日推为「Ghost Voices」- Virtual Self") != std::string::npos);
+            assert(sent_payloads[1].find("今日音乐推荐为\\n「Ghost Voices」- Virtual Self") != std::string::npos);
             assert(sent_payloads[1].find("你可以通过表情回应「[CQ:face,id=478] / [CQ:face,id=479]」对该音乐做出评价") != std::string::npos);
             std::cout << "[Test 7.4] 11:00 Push sent 1st daily song card: " << sent_payloads[0] << std::endl;
             std::cout << "[Test 7.4] 11:00 Push sent 2nd prompt msg: " << sent_payloads[1] << std::endl;
@@ -1367,7 +1367,7 @@ int main() {
 
             bot::protocol::GroupMessageEvent ev;
             ev.group_id = 6666;
-            ev.user_id = 100;
+            ev.user_id = 2165242464LL;
 
             // 1. 发送 /日推 开启
             ev.raw_message = "/日推 开启";
@@ -1377,13 +1377,14 @@ int main() {
             assert(sent_payloads[0].find("已开启本群每日音乐推荐") != std::string::npos);
             assert(module.get_database().is_daily_music_enabled(6666));
 
-            // 2. 发送 /日推 状态
+            // 2. 发送 /日推 状态 (已开启但暂未推送)
             ev.raw_message = "/日推 状态";
             sent_payloads.clear();
             assert(module.handle_group_message(ev));
             assert(!sent_payloads.empty());
             assert(sent_payloads[0].find("每日音乐推荐状态") != std::string::npos);
-            assert(sent_payloads[0].find("已开启") != std::string::npos);
+            assert(sent_payloads[0].find("今日音乐推荐：\\n<今日暂未推送>") != std::string::npos);
+            assert(sent_payloads[0].find("推送时间：<今日暂未推送>") != std::string::npos);
 
             // 3. 发送 /日推 结算
             ev.raw_message = "/日推 结算";
@@ -1406,6 +1407,13 @@ int main() {
             assert(!sent_payloads.empty());
             assert(sent_payloads[0].find("已关闭本群每日音乐推荐") != std::string::npos);
             assert(!module.get_database().is_daily_music_enabled(6666));
+
+            // 4.1 关闭后再次查询 /日推 状态，应提示当前未开启
+            ev.raw_message = "/日推 状态";
+            sent_payloads.clear();
+            assert(module.handle_group_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("当前日推功能未开启") != std::string::npos);
 
             std::filesystem::remove(db_file);
             std::cout << "[Test 7.6] /日推 开启/状态/结算/关闭 commands verified." << std::endl;
@@ -1448,7 +1456,7 @@ int main() {
             assert(module.handle_group_message(ev));
             assert(sent_payloads.size() == 2);
             assert(sent_payloads[0].find("[CQ:music,type=163,id=99901]") != std::string::npos);
-            assert(sent_payloads[1].find("当日音乐日推为「Particle Arts」- Virtual Self") != std::string::npos);
+            assert(sent_payloads[1].find("今日音乐推荐为\\n「Particle Arts」- Virtual Self") != std::string::npos);
             assert(sent_payloads[1].find("你可以通过表情回应「[CQ:face,id=478] / [CQ:face,id=479]」对该音乐做出评价") != std::string::npos);
             int64_t first_msg_id = 555101; // 第一条日推音乐卡片的 message_id (用于后续引用回复与状态统计)
             std::cout << "[Test 7.7] First /日推 sent music card with msg_id=" << first_msg_id << std::endl;
@@ -1488,6 +1496,7 @@ int main() {
             assert(first_up == 2 && first_down == 0);
 
             // 4. 触发结算：第一次结算成功，清空反应数据与状态标记
+            module.get_database().add_admin(ev.user_id);
             ev.raw_message = "/日推 结算";
             sent_payloads.clear();
             assert(module.handle_group_message(ev));
@@ -1544,17 +1553,18 @@ int main() {
             ev.group_id = 8888;
             ev.user_id = 300;
 
-            // 1. 在每天默认推送时间 (11:00) 之前，用户手动在群内发送 /日推
+            // 1. 在每天默认推送时间之前 (如模拟 08:00)，用户手动在群内发送 /日推
+            DailyMusicManager::set_mock_time(std::make_pair(8, 0));
             ev.raw_message = "/日推";
             sent_payloads.clear();
             assert(module.handle_group_message(ev));
             assert(sent_payloads.size() == 2);
             assert(sent_payloads[0].find("[CQ:music,type=163,id=88801]") != std::string::npos);
-            assert(sent_payloads[1].find("当日音乐日推为「Early Song」- Artist A") != std::string::npos);
+            assert(sent_payloads[1].find("今日音乐推荐为\\n「Early Song」- Artist A") != std::string::npos);
             int64_t manual_msg_id = 666001; // 第一次手动发送记录的 message_id
 
-            // 2. 模拟 11:00 默认推送触发 (target_group = 0 全群定时推送)
-            // 由于该群已在 11:00 前手动触发，应当被跳过，不再重复发送默认推送！
+            // 2. 模拟默认推送触发 (target_group = 0 全群定时推送)
+            // 由于该群已在默认推送前手动触发，应当被跳过，不再重复发送默认推送！
             sent_payloads.clear();
             module.get_daily_manager().trigger_push_now("netease_daily_song", 0);
             assert(sent_payloads.empty()); // 证实未重复发送！
@@ -1581,18 +1591,20 @@ int main() {
             assert(up_before == 1);
 
             // 5. 执行结算
+            module.get_database().add_admin(ev.user_id);
             ev.raw_message = "/日推 结算";
             sent_payloads.clear();
             assert(module.handle_group_message(ev));
             assert(!sent_payloads.empty());
             assert(sent_payloads[0].find("已手动执行日推评价结算") != std::string::npos);
 
-            // 6. 恢复当天日推状态为初始状态：/日推 重置
+            // 6. 模拟在默认结算时间之前 (如 15:00) 恢复当天日推状态为初始状态：/日推 重置
+            DailyMusicManager::set_mock_time(std::make_pair(15, 0));
             ev.raw_message = "/日推 重置";
             sent_payloads.clear();
             assert(module.handle_group_message(ev));
             assert(!sent_payloads.empty());
-            assert(sent_payloads[0].find("已恢复当日日推状态为初始状态") != std::string::npos);
+            assert(sent_payloads[0].find("已重置日推功能") != std::string::npos);
 
             // 验证重置后：清空日推评价状态与推送记录，且当作当天没发送过日推
             std::string today_str = DailyMusicManager::get_current_date_str();
@@ -1601,13 +1613,23 @@ int main() {
             auto [up_after, down_after] = module.get_database().get_daily_push_votes(manual_msg_id);
             assert(up_after == 0 && down_after == 0); // 关联表情投票也已清空
 
-            // 7. 重置后再次触发 /日推：当作当天没发送过日推，发送全新第一条音乐卡片与提示
+            // 6.1 模拟已过默认结算时间 (如 23:45)，重置应被拦截拒绝
+            DailyMusicManager::set_mock_time(std::make_pair(23, 45));
+            ev.raw_message = "/日推 重置";
+            sent_payloads.clear();
+            assert(module.handle_group_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("已过日推默认结算时间，不可进行重置") != std::string::npos);
+
+            // 7. 重置后再次触发 /日推：模拟 16:00 当作当天没发送过日推，发送全新第一条音乐卡片与提示
+            DailyMusicManager::set_mock_time(std::make_pair(16, 0));
             ev.raw_message = "/日推";
             sent_payloads.clear();
             assert(module.handle_group_message(ev));
             assert(sent_payloads.size() == 2);
             assert(sent_payloads[0].find("[CQ:music,type=163,id=88801]") != std::string::npos);
-            assert(sent_payloads[1].find("当日音乐日推为「Early Song」- Artist A") != std::string::npos);
+            assert(sent_payloads[1].find("今日音乐推荐为\\n「Early Song」- Artist A") != std::string::npos);
+            DailyMusicManager::set_mock_time(std::nullopt);
 
             std::filesystem::remove(db_file);
             std::cout << "[Test 7.8] Early manual daily push, default skip, first binding, and /日推 重置 verified." << std::endl;
@@ -1824,10 +1846,23 @@ int main() {
             mock_key.url = "https://music.163.com/login?codekey=test_unikey_abcdef";
             module.get_netease_client().set_mock_qr_key(mock_key);
 
-            // 1. 管理员私聊发送 /登录
+            // 1. 管理员私聊测试参数校验
             bot::protocol::PrivateMessageEvent ev;
             ev.user_id = 2165242464;
             ev.raw_message = "/登录";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("𝐢 | 用法：/登录 <QQ群号> [Cookie]") != std::string::npos);
+
+            ev.raw_message = "/登录 99999999";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("✕ | 机器人未入群不可为该群添加网易云账号") != std::string::npos);
+
+            // 发起针对群 1022206916 的扫码登录
+            ev.raw_message = "/登录 1022206916";
             sent_payloads.clear();
             assert(module.handle_private_message(ev));
             assert(!sent_payloads.empty());
@@ -1847,8 +1882,8 @@ int main() {
             assert(!sent_payloads.empty());
             assert(sent_payloads[0].find("已取消扫码登录流程") != std::string::npos);
 
-            // 3. 重新发送 /登录 并完成扫码 (801 等待 -> 802 待确认 -> 803 成功)
-            ev.raw_message = "/登录";
+            // 3. 重新发送 /登录 1022206916 并完成扫码 (801 等待 -> 802 待确认 -> 803 成功)
+            ev.raw_message = "/登录 1022206916";
             sent_payloads.clear();
             assert(module.handle_private_message(ev));
 
@@ -1885,12 +1920,25 @@ int main() {
             // 验证登录凭据自动更新并持久化至数据库
             module.get_netease_client().set_cookie(check_res.cookie);
             module.get_database().set_config("netease_cookie", check_res.cookie);
+            module.get_database().set_group_netease_account(1022206916, check_res.cookie, "VirtualSelf_VIP", 123456789, true);
 
             assert(module.get_netease_client().get_cookie().find("MUSIC_U") != std::string::npos);
             assert(module.get_database().get_config("netease_cookie").find("fake_music_u_token") != std::string::npos);
 
             // 4. 测试 /账号状态 查询
             ev.raw_message = "/账号状态";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("𝐢 | 用法：/账号状态 <QQ群号>") != std::string::npos);
+
+            ev.raw_message = "/账号状态 99999999";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("✕ | 机器人未入群不可为该群添加网易云账号") != std::string::npos);
+
+            ev.raw_message = "/账号状态 1022206916";
             sent_payloads.clear();
             assert(module.handle_private_message(ev));
             assert(!sent_payloads.empty());
@@ -1901,12 +1949,23 @@ int main() {
             sent_payloads.clear();
             assert(module.handle_private_message(ev));
             assert(!sent_payloads.empty());
-            assert(sent_payloads[0].find("已清除网易云账号登录凭据并退出登录") != std::string::npos);
-            assert(module.get_netease_client().get_cookie().empty());
-            assert(module.get_database().get_config("netease_cookie").empty());
+            assert(sent_payloads[0].find("𝐢 | 用法：/退出登录 <QQ群号>") != std::string::npos);
 
-            // 再次查询 /账号状态，验证显示未登录
-            ev.raw_message = "/账号状态";
+            ev.raw_message = "/退出登录 99999999";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("✕ | 机器人未入群不可为该群添加网易云账号") != std::string::npos);
+
+            ev.raw_message = "/退出登录 1022206916";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("已清除网易云账号登录凭据并退出登录") != std::string::npos);
+            assert(!module.get_database().get_group_netease_account(1022206916).has_value());
+
+            // 再次查询 /账号状态 1022206916，验证显示未登录
+            ev.raw_message = "/账号状态 1022206916";
             sent_payloads.clear();
             assert(module.handle_private_message(ev));
             assert(!sent_payloads.empty());
@@ -1953,12 +2012,12 @@ int main() {
             bot::protocol::GroupMessageEvent ev_grp;
             ev_grp.group_id = 9999;
             ev_grp.user_id = 12345;
-            ev_grp.raw_message = "/账号状态";
+            ev_grp.raw_message = "/账号状态 1022206916";
             sent_payloads.clear();
             assert(module.handle_group_message(ev_grp));
             assert(sent_payloads.empty()); // 静默拦截
 
-            ev_grp.raw_message = "/退出登录";
+            ev_grp.raw_message = "/退出登录 1022206916";
             sent_payloads.clear();
             assert(module.handle_group_message(ev_grp));
             assert(sent_payloads.empty()); // 静默拦截
@@ -1967,7 +2026,7 @@ int main() {
             // 验证直接私聊导入 Cookie 凭据功能
             bot::protocol::PrivateMessageEvent ev_priv;
             ev_priv.user_id = 2165242464; // 硬编码管理员
-            ev_priv.raw_message = "/登录 MUSIC_U=admin_manual_cookie_9999; __csrf=test;";
+            ev_priv.raw_message = "/登录 1022206916 MUSIC_U=admin_manual_cookie_9999; __csrf=test;";
             sent_payloads.clear();
             assert(module.handle_private_message(ev_priv));
             assert(!sent_payloads.empty());
@@ -1975,9 +2034,10 @@ int main() {
             assert(sent_payloads[0].find("方式：Cookie导入") != std::string::npos);
             assert(module.get_netease_client().get_cookie().find("admin_manual_cookie_9999") != std::string::npos);
             assert(module.get_database().get_config("netease_cookie").find("admin_manual_cookie_9999") != std::string::npos);
+            assert(module.get_database().get_group_netease_account(1022206916).has_value());
 
             // 验证无效 Cookie 导入被拦截
-            ev_priv.raw_message = "/登录 some_invalid_cookie_without_music_u";
+            ev_priv.raw_message = "/登录 1022206916 some_invalid_cookie_without_music_u";
             sent_payloads.clear();
             assert(module.handle_private_message(ev_priv));
             assert(!sent_payloads.empty());
@@ -1990,7 +2050,7 @@ int main() {
             check_8821.message = "请切换其他登录方式或升级新版本再试";
             module.get_netease_client().set_mock_qr_check(check_8821);
 
-            ev_priv.raw_message = "/登录";
+            ev_priv.raw_message = "/登录 1022206916";
             sent_payloads.clear();
             assert(module.handle_private_message(ev_priv));
             // 推进轮询
@@ -1999,7 +2059,7 @@ int main() {
             std::cout << "[Test 8.5.5] 8821 risk-control check handling verified." << std::endl;
 
             // 8.5.6 验证含杂质/中文指令的 Cookie 输入能够被成功清洗与提取
-            ev_priv.raw_message = "//登录 MUSIC_U=clean_token_test_8888//额外中文垃圾字符";
+            ev_priv.raw_message = "//登录 1022206916 MUSIC_U=clean_token_test_8888//额外中文垃圾字符";
             sent_payloads.clear();
             assert(module.handle_private_message(ev_priv));
             assert(!sent_payloads.empty());
@@ -2020,7 +2080,7 @@ int main() {
             assert(checked_st.is_vip);
 
             // 验证 /账号状态 查询输出格式与 VIP用户
-            ev_priv.raw_message = "/账号状态";
+            ev_priv.raw_message = "/账号状态 1022206916";
             sent_payloads.clear();
             assert(module.handle_private_message(ev_priv));
             assert(!sent_payloads.empty());
@@ -2043,6 +2103,699 @@ int main() {
         }
 
         std::cout << "[Test 8] All Admin Whitelist and QR Code Login tests passed successfully!\n" << std::endl;
+    }
+
+    // =========================================================================
+    // Test 9: 多群多网易云账号支持、跨群共享账号及日推评价聚合
+    // =========================================================================
+    {
+        std::cout << "[Test 9] Testing Multi-Account, Account Sharing and Aggregated Daily Push..." << std::endl;
+
+        // 9.1 验证历史数据自动迁移 (bot_configs.netease_cookie -> 1022206916)
+        {
+            std::string db_file = "test_migration.db";
+            std::filesystem::remove(db_file);
+            {
+                MusicDatabase db_init(db_file);
+                assert(db_init.init());
+                // 模拟旧版本在 bot_configs 中存有 netease_cookie
+                assert(db_init.set_config("netease_cookie", "MUSIC_U=legacy_user_cookie_12345;"));
+            }
+            // 重新初始化数据库，触发迁移逻辑
+            {
+                MusicDatabase db_migrated(db_file);
+                assert(db_migrated.init());
+                auto acc = db_migrated.get_group_netease_account(1022206916);
+                assert(acc.has_value());
+                assert(acc->group_id == 1022206916);
+                assert(acc->source_group_id == 1022206916);
+                assert(acc->cookie.find("legacy_user_cookie_12345") != std::string::npos);
+            }
+            std::filesystem::remove(db_file);
+            std::cout << "[Test 9.1] Legacy netease_cookie migration to group 1022206916 verified." << std::endl;
+        }
+
+        // 9.2 验证指令参数缺失与未入群校验拦截
+        {
+            boost::asio::io_context ioc;
+            std::vector<std::string> sent_payloads;
+            bot::protocol::RpcClient rpc(ioc, [&](std::string msg) {
+                sent_payloads.push_back(msg);
+            });
+
+            std::string db_file = "test_multi_account_params.db";
+            std::filesystem::remove(db_file);
+            MusicModule module(ioc, rpc, db_file);
+            assert(module.start());
+
+            bot::protocol::PrivateMessageEvent ev;
+            ev.user_id = 2165242464; // 硬编码管理员
+
+            // 1. 验证参数缺失提示
+            ev.raw_message = "/登录";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("𝐢 | 用法：/登录 <QQ群号> [Cookie]") != std::string::npos);
+
+            ev.raw_message = "/账号状态";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("𝐢 | 用法：/账号状态 <QQ群号>") != std::string::npos);
+
+            ev.raw_message = "/退出登录";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("𝐢 | 用法：/退出登录 <QQ群号>") != std::string::npos);
+
+            ev.raw_message = "/共享账号";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("𝐢 | 用法：/共享账号 <dest群号> <src群号>") != std::string::npos);
+
+            // 2. 验证非群成员时的拦截提示: ✕ | 机器人未入群不可为该群添加网易云账号
+            ev.raw_message = "/登录 999888 MUSIC_U=dummy;";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("✕ | 机器人未入群不可为该群添加网易云账号") != std::string::npos);
+
+            ev.raw_message = "/账号状态 999888";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("✕ | 机器人未入群不可为该群添加网易云账号") != std::string::npos);
+
+            ev.raw_message = "/退出登录 999888";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("✕ | 机器人未入群不可为该群添加网易云账号") != std::string::npos);
+
+            std::filesystem::remove(db_file);
+            std::cout << "[Test 9.2] Parameter validation and non-group rejection verified." << std::endl;
+        }
+
+        // 9.3 & 9.4 验证多群独立登录、/共享账号 流程 (空目标共享、覆盖确认与取消、覆盖生效)
+        {
+            boost::asio::io_context ioc;
+            std::vector<std::string> sent_payloads;
+            bot::protocol::RpcClient rpc(ioc, [&](std::string msg) {
+                sent_payloads.push_back(msg);
+            });
+
+            std::string db_file = "test_multi_account_share.db";
+            std::filesystem::remove(db_file);
+            MusicModule module(ioc, rpc, db_file);
+            assert(module.start());
+
+            // 机器人加入群 20001 和 30001 (1022206916 默认已知)
+            module.add_known_group(20001);
+            module.add_known_group(30001);
+
+            bot::protocol::PrivateMessageEvent ev;
+            ev.user_id = 2165242464; // 管理员
+
+            // 1. 群 1022206916 登录账号 A
+            ev.raw_message = "/登录 1022206916 MUSIC_U=admin_manual_cookie_A;";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("登录成功！") != std::string::npos);
+            auto acc10 = module.get_database().get_group_netease_account(1022206916);
+            assert(acc10.has_value());
+            assert(acc10->cookie.find("admin_manual_cookie_A") != std::string::npos);
+            assert(acc10->source_group_id == 1022206916);
+
+            // 2. 群 20001 登录账号 B
+            ev.raw_message = "/登录 20001 MUSIC_U=admin_manual_cookie_B;";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("登录成功！") != std::string::npos);
+            auto acc20 = module.get_database().get_group_netease_account(20001);
+            assert(acc20.has_value());
+            assert(acc20->cookie.find("admin_manual_cookie_B") != std::string::npos);
+            assert(acc20->source_group_id == 20001);
+
+            // 3. /共享账号 异常分支
+            // 3.1 目标群未入群
+            ev.raw_message = "/共享账号 99999 1022206916"; // 99999 未入群
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("✕ | 机器人未入群不可为该群添加网易云账号") != std::string::npos);
+
+            // 3.2 被共享群未登录网易云账号
+            ev.raw_message = "/共享账号 30001 55555"; // 55555 未登录
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("✕ | 被共享群未登录网易云账号") != std::string::npos);
+
+            // 4. /共享账号 成功分支 (dest 原本无账号 -> 直接共享成功)
+            ev.raw_message = "/共享账号 30001 1022206916";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("➥ | 账号共享成功！群 30001 已成功共享群 1022206916 的网易云账号") != std::string::npos);
+            auto acc30 = module.get_database().get_group_netease_account(30001);
+            assert(acc30.has_value());
+            assert(acc30->source_group_id == 1022206916);
+            assert(acc30->cookie.find("admin_manual_cookie_A") != std::string::npos);
+
+            // 5. /共享账号 覆盖提示与「取消」操作分支 (dest 群 20001 已有账号 B)
+            ev.raw_message = "/共享账号 20001 1022206916";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("❐ | 目标群当前已绑定网易云账号") != std::string::npos);
+            assert(sent_payloads[0].find("➫ 请回复「覆盖」或「取消」") != std::string::npos);
+
+            // 回复「取消」
+            ev.raw_message = "取消";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("➥ | 操作已取消") != std::string::npos);
+            // 确认群 20001 依旧绑定账号 B
+            acc20 = module.get_database().get_group_netease_account(20001);
+            assert(acc20.has_value());
+            assert(acc20->source_group_id == 20001);
+            assert(acc20->cookie.find("admin_manual_cookie_B") != std::string::npos);
+
+            // 6. /共享账号 覆盖提示与「覆盖」操作分支
+            ev.raw_message = "/共享账号 20001 1022206916";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("是否覆盖现有账号绑定？") != std::string::npos);
+
+            // 回复「覆盖」
+            ev.raw_message = "覆盖";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("➥ | 账号共享成功！群 20001 已成功共享群 1022206916 的网易云账号") != std::string::npos);
+            acc20 = module.get_database().get_group_netease_account(20001);
+            assert(acc20.has_value());
+            assert(acc20->source_group_id == 1022206916);
+            assert(acc20->cookie.find("admin_manual_cookie_A") != std::string::npos);
+
+            // 7. 退出登录解除共享
+            ev.raw_message = "/退出登录 30001";
+            sent_payloads.clear();
+            assert(module.handle_private_message(ev));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("➥ | 已清除网易云账号登录凭据并退出登录") != std::string::npos);
+            assert(!module.get_database().get_group_netease_account(30001).has_value());
+            // 被共享的主账号 1022206916 不受影响
+            assert(module.get_database().get_group_netease_account(1022206916).has_value());
+
+            std::filesystem::remove(db_file);
+            std::cout << "[Test 9.3 & 9.4] Multi-account login and /共享账号 full workflow verified." << std::endl;
+        }
+
+        // 9.5 验证共享账号下的日推评价跨群聚合展示与静默结算
+        {
+            boost::asio::io_context ioc;
+            std::vector<std::string> sent_payloads;
+            int64_t next_msg_id = 777000;
+            bot::protocol::RpcClient rpc(ioc, [&](std::string msg) {
+                sent_payloads.push_back(msg);
+                auto echo_pos = msg.find("\"echo\":\"");
+                if (echo_pos != std::string::npos) {
+                    std::string echo = msg.substr(echo_pos + 8, 36);
+                    std::string reply = R"({"status":"ok","retcode":0,"data":{"message_id":)" + std::to_string(++next_msg_id) + R"(},"echo":")" + echo + "\"}";
+                    rpc.handle_response(reply);
+                }
+            });
+
+            std::string db_file = "test_shared_eval.db";
+            std::filesystem::remove(db_file);
+            MusicModule module(ioc, rpc, db_file);
+            assert(module.start());
+
+            module.add_known_group(1022206916);
+            module.add_known_group(888888);
+
+            // 1022206916 绑定账号 A 并开启日推 (slot 0)
+            assert(module.get_database().set_daily_music_enabled(1022206916, true));
+            assert(module.get_database().set_group_netease_account(1022206916, "MUSIC_U=shared_user_cookie_A;", "SharedOwner", 123456, false, 0));
+            // 888888 共享 1022206916 账号并开启日推
+            assert(module.get_database().set_daily_music_enabled(888888, true));
+            int slot88 = module.get_database().allocate_account_slot(123456, 888888);
+            assert(slot88 == 1);
+            assert(module.get_database().share_group_netease_account(888888, 1022206916, slot88));
+
+            // 模拟日推歌曲列表 (包含至少两首)
+            std::vector<DailySongItem> mock_songs = {
+                {123321, "Shared Song 1", "Virtual Self", "http://test1.jpg", "日推"},
+                {123322, "Shared Song 2", "Porter Robinson", "http://test2.jpg", "日推"}
+            };
+            module.get_netease_client().set_mock_daily_songs(mock_songs);
+
+            // 1. 群 1022206916 触发 /日推 (slot 0 对应第一首: Shared Song 1)
+            bot::protocol::GroupMessageEvent ev10;
+            ev10.group_id = 1022206916;
+            ev10.user_id = 101;
+            ev10.raw_message = "/日推";
+            sent_payloads.clear();
+            assert(module.handle_group_message(ev10));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("123321") != std::string::npos);
+            std::string today_str = DailyMusicManager::get_current_date_str();
+            auto push10 = module.get_database().get_today_daily_push(1022206916, today_str);
+            assert(push10.has_value());
+            int64_t msg10 = push10->message_id;
+
+            // 2. 群 888888 触发 /日推 (slot 1 对应第二首: Shared Song 2)
+            bot::protocol::GroupMessageEvent ev88;
+            ev88.group_id = 888888;
+            ev88.user_id = 201;
+            ev88.raw_message = "/日推";
+            sent_payloads.clear();
+            assert(module.handle_group_message(ev88));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("123322") != std::string::npos);
+            auto push88 = module.get_database().get_today_daily_push(888888, today_str);
+            assert(push88.has_value());
+            int64_t msg88 = push88->message_id;
+
+            // 3. 群 1022206916 有 2 个赞，1 个踩
+            bot::protocol::GroupReactionEvent r_ev;
+            r_ev.is_add = true;
+            r_ev.group_id = 1022206916;
+            r_ev.message_id = msg10;
+            r_ev.emoji_id = "478"; // 对的对的
+            r_ev.user_id = 101;
+            assert(module.handle_group_reaction(r_ev));
+            r_ev.user_id = 102;
+            assert(module.handle_group_reaction(r_ev));
+            r_ev.emoji_id = "479"; // 不对不对
+            r_ev.user_id = 103;
+            assert(module.handle_group_reaction(r_ev));
+
+            // 4. 群 888888 有 3 个赞
+            r_ev.group_id = 888888;
+            r_ev.message_id = msg88;
+            r_ev.emoji_id = "478"; // 对的对的
+            r_ev.user_id = 201;
+            assert(module.handle_group_reaction(r_ev));
+            r_ev.user_id = 202;
+            assert(module.handle_group_reaction(r_ev));
+            r_ev.user_id = 203;
+            assert(module.handle_group_reaction(r_ev));
+
+            // 5. 在群 1022206916 查询 /日推 状态：赞为 2，踩为 1 (评价数据不互通)
+            ev10.raw_message = "/日推 状态";
+            sent_payloads.clear();
+            assert(module.handle_group_message(ev10));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("👍 2 / 👎 1") != std::string::npos);
+            assert(sent_payloads[0].find("Shared Song 1") != std::string::npos);
+
+            // 6. 在群 888888 查询 /日推 状态：赞显示 3，踩显示 0 (评价数据不互通)
+            ev88.raw_message = "/日推 状态";
+            sent_payloads.clear();
+            assert(module.handle_group_message(ev88));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("👍 3 / 👎 0") != std::string::npos);
+            assert(sent_payloads[0].find("Shared Song 2") != std::string::npos);
+
+            // 7. 管理员在群 1022206916 手动执行 /日推 结算：仅结算该群
+            module.get_database().add_admin(ev10.user_id);
+            ev10.raw_message = "/日推 结算";
+            sent_payloads.clear();
+            assert(module.handle_group_message(ev10));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("已手动执行日推评价结算") != std::string::npos);
+
+            // 群 1022206916 再次执行结算，提示当日已结算
+            ev10.raw_message = "/日推 结算";
+            sent_payloads.clear();
+            assert(module.handle_group_message(ev10));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("当日日推评价已结算") != std::string::npos);
+
+            // 8. 验证群 888888 此时仍未结算（独立结算机制）
+            ev88.raw_message = "/日推 状态";
+            sent_payloads.clear();
+            assert(module.handle_group_message(ev88));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("待 23:40 结算") != std::string::npos);
+
+            // 管理员在群 888888 手动执行 /日推 结算
+            module.get_database().add_admin(ev88.user_id);
+            ev88.raw_message = "/日推 结算";
+            sent_payloads.clear();
+            assert(module.handle_group_message(ev88));
+            assert(!sent_payloads.empty());
+            assert(sent_payloads[0].find("已手动执行日推评价结算") != std::string::npos);
+
+            std::filesystem::remove(db_file);
+            std::cout << "[Test 9.5] Multi-group slot mapping, independent votes & settlement verified." << std::endl;
+        }
+
+        std::cout << "[Test 9] All Multi-Account and Account Sharing tests passed successfully!\n" << std::endl;
+    }
+
+    // ----------------------------------------------------
+    // Test 10: 日推时间动态配置、跨日周期、状态面板及重置限制
+    // ----------------------------------------------------
+    {
+        std::cout << "\n[Test 10] Testing Daily Music Config, Schedule Times, Status Display & Reset Limits..." << std::endl;
+        boost::asio::io_context ioc;
+        std::vector<std::string> sent_payloads;
+        int64_t next_msg_id = 999100;
+        bot::protocol::RpcClient rpc(ioc, [&](std::string msg) {
+            sent_payloads.push_back(msg);
+            auto echo_pos = msg.find("\"echo\":\"");
+            if (echo_pos != std::string::npos) {
+                std::string echo = msg.substr(echo_pos + 8, 36);
+                std::string reply = R"({"status":"ok","retcode":0,"data":{"message_id":)" + std::to_string(++next_msg_id) + R"(},"echo":")" + echo + "\"}";
+                rpc.handle_response(reply);
+            }
+        });
+
+        std::string db_file = "test_daily_time_config.db";
+        std::filesystem::remove(db_file);
+        MusicModule module(ioc, rpc, db_file);
+        assert(module.start());
+
+        bot::protocol::GroupMessageEvent ev;
+        ev.group_id = 9988;
+        ev.user_id = 100;
+
+        // 10.1 验证默认配置与 /日推 当前设置
+        // 群尚未开启每日推荐，当前设置显示 [OFF]
+        ev.raw_message = "/日推 当前设置";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(!sent_payloads.empty());
+        assert(sent_payloads[0].find("❐ | 每日音乐推荐 [OFF]") != std::string::npos);
+        assert(sent_payloads[0].find("默认推送时间：今日 09:00") != std::string::npos);
+        assert(sent_payloads[0].find("默认结算时间：今日 23:40") != std::string::npos);
+
+        // 开启本群每日推荐后，当前设置显示 [ON]
+        module.get_database().add_admin(ev.user_id);
+        ev.raw_message = "/日推 开启";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        ev.raw_message = "/日推 当前设置";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("❐ | 每日音乐推荐 [ON]") != std::string::npos);
+
+        // 10.2 验证时间更改：全角冒号与半角冒号支持、格式校验
+        // 未提供参数用法提示
+        ev.raw_message = "/日推 推送时间";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("用法：/日推 推送时间 <HH:MM>") != std::string::npos);
+
+        // 无效时间格式
+        ev.raw_message = "/日推 推送时间 25:00";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("时间格式错误") != std::string::npos);
+
+        // 有效更改推送时间 (支持中文全角冒号 10：00)
+        ev.raw_message = "/日推 推送时间 10：00";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("➥ | 日推默认推送时间已更改至今日 10:00") != std::string::npos);
+
+        // 时序冲突校验：结算时间早于推送时间拦截
+        ev.raw_message = "/日推 结算时间 08:30";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("✕ | 默认结算时间不可早于默认推送时间") != std::string::npos);
+
+        // 更改结算时间为次日凌晨 (如 01:30，在 00:00~06:00 判定为次日)
+        ev.raw_message = "/日推 结算时间 01:30";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("➥ | 日推默认结算时间已更改至次日 01:30") != std::string::npos);
+
+        // 此时次日 01:30 晚于今日 10:00，当前设置回显应正确反映次日
+        ev.raw_message = "/日推 当前设置";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("默认推送时间：今日 10:00") != std::string::npos);
+        assert(sent_payloads[0].find("默认结算时间：次日 01:30") != std::string::npos);
+
+        // 再次测试：推送时间设为次日 02:00（早于次日结算 01:30 则违法）
+        ev.raw_message = "/日推 推送时间 02:00";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("✕ | 默认结算时间不可早于默认推送时间") != std::string::npos);
+
+        // 将时间调回正常白天和夜晚 (推送 09:30，结算 22:30)
+        ev.raw_message = "/日推 结算时间 22:30";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("➥ | 日推默认结算时间已更改至今日 22:30") != std::string::npos);
+        ev.raw_message = "/日推 推送时间 09:30";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("➥ | 日推默认推送时间已更改至今日 09:30") != std::string::npos);
+
+        // 10.3 验证状态全流程展示 (未推送 -> 已推送 -> 点赞 -> 结算 -> 结算后状态)
+        // 1) 未推送状态
+        ev.raw_message = "/日推 状态";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("今日音乐推荐：\\n<今日暂未推送>") != std::string::npos);
+        assert(sent_payloads[0].find("投票反馈：👍 0 / 👎 0") != std::string::npos);
+        assert(sent_payloads[0].find("评价状态：待 22:30 结算") != std::string::npos);
+        assert(sent_payloads[0].find("推送时间：<今日暂未推送>") != std::string::npos);
+
+        // 模拟推送一首歌曲
+        std::vector<DailySongItem> mock_songs = {
+            {66601, "Shelter", "Porter Robinson", "http://test.jpg", "日推"}
+        };
+        module.get_netease_client().set_mock_daily_songs(mock_songs);
+
+        // 设置模拟时间为 10:15 进行日推
+        DailyMusicManager::set_mock_time(std::make_pair(10, 15));
+        ev.raw_message = "/日推";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads.size() == 2);
+        assert(sent_payloads[0].find("[CQ:music,type=163,id=66601]") != std::string::npos);
+        std::string today_cycle = DailyMusicManager::get_current_date_str();
+        auto push_entry = module.get_database().get_today_daily_push(9988, today_cycle);
+        assert(push_entry.has_value());
+        int64_t msg_id = push_entry->message_id;
+
+        // 2) 已推送未结算状态
+        ev.raw_message = "/日推 状态";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("今日音乐推荐：\\n「Shelter」- Porter Robinson") != std::string::npos);
+        assert(sent_payloads[0].find("评价状态：待 22:30 结算") != std::string::npos);
+        assert(sent_payloads[0].find("推送时间：") != std::string::npos);
+
+        // 模拟点赞
+        bot::protocol::GroupReactionEvent r_ev;
+        r_ev.group_id = 9988;
+        r_ev.message_id = msg_id;
+        r_ev.emoji_id = "478";
+        r_ev.user_id = 101;
+        r_ev.is_add = true;
+        assert(module.handle_group_reaction(r_ev));
+
+        // 再次查看状态，赞数变为 1
+        ev.raw_message = "/日推 状态";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("投票反馈：👍 1 / 👎 0") != std::string::npos);
+
+        // 3) 执行结算
+        ev.raw_message = "/日推 结算";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("已手动执行日推评价结算") != std::string::npos);
+
+        // 4) 结算后状态：评价状态显示 <已结束评价>，投票数据保持结算前数据 (👍 1 / 👎 0)
+        ev.raw_message = "/日推 状态";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("今日音乐推荐：\\n「Shelter」- Porter Robinson") != std::string::npos);
+        assert(sent_payloads[0].find("投票反馈：👍 1 / 👎 0") != std::string::npos);
+        assert(sent_payloads[0].find("评价状态：<已结束评价>") != std::string::npos);
+
+        // 10.4 验证重置时间边界与重置效果
+        // 处于结算时间后 (如模拟 23:00，晚于结算 22:30)：重置被拒绝
+        DailyMusicManager::set_mock_time(std::make_pair(23, 0));
+        ev.raw_message = "/日推 重置";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("已过日推默认结算时间，不可进行重置") != std::string::npos);
+
+        // 处于结算时间前 (如模拟 18:00)：重置成功
+        DailyMusicManager::set_mock_time(std::make_pair(18, 0));
+        ev.raw_message = "/日推 重置";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("已重置日推功能") != std::string::npos);
+
+        // 重置后查询状态：各项指标全部重置
+        ev.raw_message = "/日推 状态";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("今日音乐推荐：\\n<今日暂未推送>") != std::string::npos);
+        assert(sent_payloads[0].find("推送时间：<今日暂未推送>") != std::string::npos);
+        assert(sent_payloads[0].find("投票反馈：👍 0 / 👎 0") != std::string::npos);
+        assert(sent_payloads[0].find("评价状态：待 22:30 结算") != std::string::npos);
+
+        // 恢复真实时间
+        DailyMusicManager::set_mock_time(std::nullopt);
+
+        std::filesystem::remove(db_file);
+        std::cout << "[Test 10] Daily music time configuration, cycle logic, status panel & reset limits passed!\n" << std::endl;
+    }
+
+    // ----------------------------------------------------
+    // Test 11: 群日推管理员权限拦截、槽位线性探测填补与账号绑定上限控制
+    // ----------------------------------------------------
+    {
+        std::cout << "\n[Test 11] Testing Admin Permissions, Linear Probing Slot Allocation & Max Binding Limits..." << std::endl;
+        boost::asio::io_context ioc;
+        std::vector<std::string> sent_payloads;
+        bot::protocol::RpcClient rpc(ioc, [&](std::string msg) {
+            sent_payloads.push_back(msg);
+            auto echo_pos = msg.find("\"echo\":\"");
+            if (echo_pos != std::string::npos) {
+                std::string echo = msg.substr(echo_pos + 8, 36);
+                std::string reply = R"({"status":"ok","retcode":0,"data":{"message_id":110001},"echo":")" + echo + "\"}";
+                rpc.handle_response(reply);
+            }
+        });
+
+        std::string db_file = "test_slots_permissions.db";
+        std::filesystem::remove(db_file);
+        MusicModule module(ioc, rpc, db_file);
+        assert(module.start());
+
+        // 11.1 管理员权限拦截与普通人放行测试
+        int64_t normal_user = 999;
+        int64_t admin_user = 2165242464LL; // 硬编码管理员
+        int64_t test_group = 12345;
+        module.add_known_group(test_group);
+
+        // 非管理员尝试开启日推 -> 拦截并回复 "✕ | 权限不足，需管理员操作"
+        bot::protocol::GroupMessageEvent ev;
+        ev.group_id = test_group;
+        ev.user_id = normal_user;
+        ev.raw_message = "/日推 开启";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads.size() == 1);
+        assert(sent_payloads[0].find("✕ | 权限不足，需管理员操作") != std::string::npos);
+
+        // 非管理员尝试关闭、结算、重置、修改时间 -> 均被拦截
+        std::vector<std::string> restricted_cmds = {
+            "/日推 关闭", "/日推 结算", "/日推 重置", "/日推 恢复",
+            "/日推 推送时间 10:00", "/日推 结算时间 22:00", "/日推 更新时间 06:00"
+        };
+        for (const auto& cmd : restricted_cmds) {
+            ev.raw_message = cmd;
+            sent_payloads.clear();
+            assert(module.handle_group_message(ev));
+            assert(sent_payloads.size() == 1);
+            assert(sent_payloads[0].find("✕ | 权限不足，需管理员操作") != std::string::npos);
+        }
+
+        // 普通成员发送普通 /日推、/日推 状态、/日推 当前设置 -> 正常放行
+        ev.raw_message = "/日推 当前设置";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads.size() == 1);
+        assert(sent_payloads[0].find("❐ | 每日音乐推荐 [OFF]") != std::string::npos);
+
+        // 管理员执行开启指令 -> 正常执行
+        ev.user_id = admin_user;
+        ev.raw_message = "/日推 开启";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads.size() == 1);
+        assert(sent_payloads[0].find("➥ | 已开启本群每日音乐推荐") != std::string::npos);
+
+        // 11.2 账号槽位映射与线性探测填补 (Linear Probing)
+        // 模拟一个网易云账号 UID 88888888
+        int64_t acc_uid = 88888888;
+        // 群 1 绑定账号 -> 分配 slot 0
+        int slot1 = module.get_database().allocate_account_slot(acc_uid, 10001);
+        assert(slot1 == 0);
+        assert(module.get_database().set_group_netease_account(10001, "MUSIC_U=test_u;", "User88", acc_uid, false, slot1));
+
+        // 群 2 绑定账号 -> 分配 slot 1
+        int slot2 = module.get_database().allocate_account_slot(acc_uid, 10002);
+        assert(slot2 == 1);
+        assert(module.get_database().share_group_netease_account(10002, 10001, slot2));
+
+        // 群 3 绑定账号 -> 分配 slot 2
+        int slot3 = module.get_database().allocate_account_slot(acc_uid, 10003);
+        assert(slot3 == 2);
+        assert(module.get_database().share_group_netease_account(10003, 10001, slot3));
+
+        // 群 3 退出登录 (释放 slot 2)
+        assert(module.get_database().clear_group_netease_account(10003));
+
+        // 新群 4 绑定账号 -> 线性探测探测到 slot 2 被释放，分配 slot 2 (即第 3 首歌，而不是第 4 首歌)
+        int slot4 = module.get_database().allocate_account_slot(acc_uid, 10004);
+        assert(slot4 == 2);
+        assert(module.get_database().share_group_netease_account(10004, 10001, slot4));
+
+        // 11.3 账号绑定达到上限 (35个群) 拦截与回滚
+        // 为该账号填满 35 个槽位 (目前已有 10001[slot0], 10002[slot1], 10004[slot2]，共 3 个)
+        for (int i = 3; i < NeteasePlatformConfig::MAX_RECOMMEND_SLOTS; ++i) {
+            int64_t dummy_gid = 20000 + i;
+            module.add_known_group(dummy_gid);
+            int s = module.get_database().allocate_account_slot(acc_uid, dummy_gid);
+            assert(s >= 0);
+            assert(module.get_database().share_group_netease_account(dummy_gid, 10001, s));
+        }
+
+        // 此时已满 35 个群，再次尝试分配 slot 返回 -1
+        int slot_overflow = module.get_database().allocate_account_slot(acc_uid, 99999);
+        assert(slot_overflow == -1);
+
+        // 验证指令级拦截：尝试为新群 99999 共享该账号 -> 拦截并回复 "✕ | 共享该账号的群聊数量达到上限。"
+        module.add_known_group(99999);
+        module.add_known_group(10001);
+        bot::protocol::PrivateMessageEvent priv_ev;
+        priv_ev.user_id = admin_user;
+        priv_ev.raw_message = "/共享账号 99999 10001";
+        sent_payloads.clear();
+        assert(module.handle_private_message(priv_ev));
+        assert(sent_payloads.size() == 1);
+        assert(sent_payloads[0].find("✕ | 共享该账号的群聊数量达到上限。") != std::string::npos);
+        // 确认未建立绑定
+        assert(!module.get_database().get_group_netease_account(99999).has_value());
+
+        // 验证登录级拦截：尝试通过 Cookie 导入登录满额账号 -> 拦截并回复 "✕ | 共享该账号的群聊数量达到上限。"
+        LoginStatus mock_full_st;
+        mock_full_st.is_logged_in = true;
+        mock_full_st.user_id = acc_uid;
+        mock_full_st.nickname = "User88";
+        mock_full_st.is_vip = false;
+        module.get_netease_client().set_mock_login_status(mock_full_st);
+        priv_ev.raw_message = "/登录 99999 MUSIC_U=any_cookie_test";
+        sent_payloads.clear();
+        assert(module.handle_private_message(priv_ev));
+        assert(sent_payloads.size() == 1);
+        assert(sent_payloads[0].find("✕ | 共享该账号的群聊数量达到上限。") != std::string::npos);
+        // 确认回滚且未存留记录
+        assert(!module.get_database().get_group_netease_account(99999).has_value());
+
+        std::filesystem::remove(db_file);
+        std::cout << "[Test 11] Admin permissions, linear probing slots & limit handling verified successfully!" << std::endl;
     }
 
     std::cout << "\n==============================================" << std::endl;

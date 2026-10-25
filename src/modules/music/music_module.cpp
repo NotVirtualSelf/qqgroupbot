@@ -203,6 +203,63 @@ std::string get_platform_full_name(const std::string& platform) {
     return "网易云音乐";
 }
 
+bool parse_time_hh_mm(const std::string& str, int& out_hour, int& out_minute) {
+    std::string s = trim(str);
+    if (s.empty()) return false;
+
+    // 将中文全角冒号 '：' 替换为半角 ':'
+    std::string norm;
+    for (size_t i = 0; i < s.size(); ) {
+        if (static_cast<unsigned char>(s[i]) == 0xEF && i + 2 < s.size() &&
+            static_cast<unsigned char>(s[i+1]) == 0xBC && static_cast<unsigned char>(s[i+2]) == 0x9A) {
+            norm += ':';
+            i += 3;
+        } else {
+            norm += s[i];
+            i++;
+        }
+    }
+
+    auto colon_pos = norm.find(':');
+    if (colon_pos == std::string::npos) return false;
+
+    std::string h_str = trim(norm.substr(0, colon_pos));
+    std::string m_str = trim(norm.substr(colon_pos + 1));
+    if (h_str.empty() || m_str.empty()) return false;
+
+    try {
+        int h = std::stoi(h_str);
+        int m = std::stoi(m_str);
+        if (h < 0 || h > 23 || m < 0 || m > 59) {
+            return false;
+        }
+        out_hour = h;
+        out_minute = m;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+int get_cycle_offset_minutes(int h, int m, int update_h, int update_m) {
+    int t = h * 60 + m;
+    int update_t = update_h * 60 + update_m;
+    if (t >= update_t) {
+        return t - update_t;
+    } else {
+        return (1440 - update_t) + t;
+    }
+}
+
+std::string format_time_label(int hour, int minute, int update_hour, int update_minute) {
+    int t = hour * 60 + minute;
+    int update_t = update_hour * 60 + update_minute;
+    std::string day_prefix = (t >= update_t) ? "今日" : "次日";
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d", hour, minute);
+    return day_prefix + " " + buf;
+}
+
 } // namespace
 
 MusicModule::MusicModule(boost::asio::io_context& ioc,
@@ -221,6 +278,19 @@ MusicModule::MusicModule(boost::asio::io_context& ioc,
 {
     daily_manager_ = std::make_unique<DailyMusicManager>(ioc_, rpc_client_, db_);
     daily_manager_->register_recommender(std::make_shared<NeteaseDailySongRecommender>(netease_));
+    add_known_group(1022206916);
+}
+
+bool MusicModule::is_bot_in_group(int64_t group_id) const {
+    if (group_id <= 0) return false;
+    std::lock_guard<std::mutex> lock(groups_mutex_);
+    return known_groups_.find(group_id) != known_groups_.end();
+}
+
+void MusicModule::add_known_group(int64_t group_id) {
+    if (group_id <= 0) return;
+    std::lock_guard<std::mutex> lock(groups_mutex_);
+    known_groups_.insert(group_id);
 }
 
 MusicModule::~MusicModule() {
@@ -233,6 +303,11 @@ bool MusicModule::start() {
         return false;
     }
 
+    add_known_group(1022206916);
+    for (int64_t gid : db_.get_all_known_groups()) {
+        add_known_group(gid);
+    }
+
     std::string saved_cookie = db_.get_config("netease_cookie");
     if (!saved_cookie.empty()) {
         netease_->set_cookie(saved_cookie);
@@ -243,6 +318,8 @@ bool MusicModule::start() {
     schedule_timer();
     schedule_cover_timer();
     if (daily_manager_) {
+        auto time_cfg = db_.get_daily_music_time_config();
+        daily_manager_->update_schedule_times(time_cfg.push_hour, time_cfg.push_minute, time_cfg.eval_hour, time_cfg.eval_minute);
         daily_manager_->start();
     }
     std::cout << "[MusicModule] MusicModule started! Polling interval: "
@@ -265,6 +342,7 @@ void MusicModule::stop() {
 }
 
 bool MusicModule::handle_group_reaction(const bot::protocol::GroupReactionEvent& event) {
+    add_known_group(event.group_id);
     if (daily_manager_) {
         daily_manager_->handle_reaction(event);
         return true;
@@ -920,6 +998,7 @@ bool MusicModule::handle_candidate_selection(const bot::protocol::GroupMessageEv
 }
 
 bool MusicModule::handle_group_message(const bot::protocol::GroupMessageEvent& event) {
+    add_known_group(event.group_id);
     std::string text = trim(event.raw_message);
     if (text.empty()) return false;
 
@@ -938,7 +1017,14 @@ bool MusicModule::handle_group_message(const bot::protocol::GroupMessageEvent& e
     }
 
     if (text == "/账号状态" || text == ".账号状态" || text == "/登录状态" || text == ".登录状态" ||
-        text == "/退出登录" || text == ".退出登录" || text == "/logout" || text == ".logout") {
+        text == "/退出登录" || text == ".退出登录" || text == "/logout" || text == ".logout" ||
+        text.rfind("/账号状态", 0) == 0 || text.rfind(".账号状态", 0) == 0 ||
+        text.rfind("/退出登录", 0) == 0 || text.rfind(".退出登录", 0) == 0) {
+        return true;
+    }
+
+    if (text == "/共享账号" || text == ".共享账号" ||
+        text.rfind("/共享账号", 0) == 0 || text.rfind(".共享账号", 0) == 0) {
         return true;
     }
 
@@ -1370,50 +1456,201 @@ bool MusicModule::handle_group_message(const bot::protocol::GroupMessageEvent& e
         else if (text.rfind("/每日推荐", 0) == 0) sub_arg = trim(text.substr(13));
         else if (text.rfind(".每日推荐", 0) == 0) sub_arg = trim(text.substr(13));
 
+        bool is_admin_only_sub = (
+            sub_arg == "开启" || sub_arg == "on" || sub_arg == "enable" || sub_arg == "start" ||
+            sub_arg == "关闭" || sub_arg == "off" || sub_arg == "disable" || sub_arg == "stop" ||
+            sub_arg == "重置" || sub_arg == "恢复" || sub_arg == "reset" ||
+            sub_arg == "结算" || sub_arg == "eval" ||
+            sub_arg == "推送时间" || sub_arg.rfind("推送时间", 0) == 0 ||
+            sub_arg == "结算时间" || sub_arg.rfind("结算时间", 0) == 0 ||
+            sub_arg == "更新时间" || sub_arg.rfind("更新时间", 0) == 0
+        );
+
+        if (is_admin_only_sub && !db_.is_admin(event.user_id)) {
+            rpc_client_.send_group_msg(event.group_id, "✕ | 权限不足，需管理员操作");
+            return true;
+        }
+
         if (sub_arg == "开启" || sub_arg == "on" || sub_arg == "enable" || sub_arg == "start") {
             db_.set_daily_music_enabled(event.group_id, true);
-            rpc_client_.send_group_msg(event.group_id, "➥ | 已开启本群每日音乐推荐\n(每天 11:00 自动推送，23:00 反馈日推数据)");
+            rpc_client_.send_group_msg(event.group_id, "➥ | 已开启本群每日音乐推荐");
             return true;
         } else if (sub_arg == "关闭" || sub_arg == "off" || sub_arg == "disable" || sub_arg == "stop") {
             db_.set_daily_music_enabled(event.group_id, false);
             rpc_client_.send_group_msg(event.group_id, "➥ | 已关闭本群每日音乐推荐");
             return true;
+        } else if (sub_arg == "当前设置" || sub_arg == "设置" || sub_arg == "config") {
+            bool enabled = db_.is_daily_music_enabled(event.group_id);
+            auto time_cfg = db_.get_daily_music_time_config();
+            std::string msg = "❐ | 每日音乐推荐 [" + std::string(enabled ? "ON" : "OFF") + "]\n";
+            msg += "默认推送时间：" + format_time_label(time_cfg.push_hour, time_cfg.push_minute, time_cfg.update_hour, time_cfg.update_minute) + "\n";
+            msg += "默认结算时间：" + format_time_label(time_cfg.eval_hour, time_cfg.eval_minute, time_cfg.update_hour, time_cfg.update_minute);
+            rpc_client_.send_group_msg(event.group_id, msg);
+            return true;
+        } else if (sub_arg == "推送时间" || sub_arg.rfind("推送时间", 0) == 0) {
+            std::string time_str;
+            if (sub_arg.length() > std::string("推送时间").length()) {
+                time_str = trim(sub_arg.substr(std::string("推送时间").length()));
+            }
+            if (time_str.empty()) {
+                rpc_client_.send_group_msg(event.group_id, "𝐢 | 用法：/日推 推送时间 <HH:MM>");
+                return true;
+            }
+
+            int new_h = 0, new_m = 0;
+            if (!parse_time_hh_mm(time_str, new_h, new_m)) {
+                rpc_client_.send_group_msg(event.group_id, "✕ | 时间格式错误，请使用 HH:MM 格式 (如 09:00)");
+                return true;
+            }
+
+            auto time_cfg = db_.get_daily_music_time_config();
+            int new_push_offset = get_cycle_offset_minutes(new_h, new_m, time_cfg.update_hour, time_cfg.update_minute);
+            int current_eval_offset = get_cycle_offset_minutes(time_cfg.eval_hour, time_cfg.eval_minute, time_cfg.update_hour, time_cfg.update_minute);
+
+            if (current_eval_offset < new_push_offset) {
+                rpc_client_.send_group_msg(event.group_id, "✕ | 默认结算时间不可早于默认推送时间");
+                return true;
+            }
+
+            db_.set_daily_push_time(new_h, new_m);
+            if (daily_manager_) {
+                daily_manager_->update_schedule_times(new_h, new_m, time_cfg.eval_hour, time_cfg.eval_minute);
+            }
+            std::string label = format_time_label(new_h, new_m, time_cfg.update_hour, time_cfg.update_minute);
+            rpc_client_.send_group_msg(event.group_id, "➥ | 日推默认推送时间已更改至" + label);
+            return true;
+        } else if (sub_arg == "结算时间" || sub_arg.rfind("结算时间", 0) == 0) {
+            std::string time_str;
+            if (sub_arg.length() > std::string("结算时间").length()) {
+                time_str = trim(sub_arg.substr(std::string("结算时间").length()));
+            }
+            if (time_str.empty()) {
+                rpc_client_.send_group_msg(event.group_id, "𝐢 | 用法：/日推 结算时间 <HH:MM>");
+                return true;
+            }
+
+            int new_h = 0, new_m = 0;
+            if (!parse_time_hh_mm(time_str, new_h, new_m)) {
+                rpc_client_.send_group_msg(event.group_id, "✕ | 时间格式错误，请使用 HH:MM 格式 (如 23:40)");
+                return true;
+            }
+
+            auto time_cfg = db_.get_daily_music_time_config();
+            int current_push_offset = get_cycle_offset_minutes(time_cfg.push_hour, time_cfg.push_minute, time_cfg.update_hour, time_cfg.update_minute);
+            int new_eval_offset = get_cycle_offset_minutes(new_h, new_m, time_cfg.update_hour, time_cfg.update_minute);
+
+            if (new_eval_offset < current_push_offset) {
+                rpc_client_.send_group_msg(event.group_id, "✕ | 默认结算时间不可早于默认推送时间");
+                return true;
+            }
+
+            db_.set_daily_eval_time(new_h, new_m);
+            if (daily_manager_) {
+                daily_manager_->update_schedule_times(time_cfg.push_hour, time_cfg.push_minute, new_h, new_m);
+            }
+            std::string label = format_time_label(new_h, new_m, time_cfg.update_hour, time_cfg.update_minute);
+            rpc_client_.send_group_msg(event.group_id, "➥ | 日推默认结算时间已更改至" + label);
+            return true;
+        } else if (sub_arg == "更新时间" || sub_arg.rfind("更新时间", 0) == 0) {
+            std::string time_str;
+            if (sub_arg.length() > std::string("更新时间").length()) {
+                time_str = trim(sub_arg.substr(std::string("更新时间").length()));
+            }
+            if (time_str.empty()) {
+                rpc_client_.send_group_msg(event.group_id, "𝐢 | 用法：/日推 更新时间 <HH:MM>");
+                return true;
+            }
+
+            int new_h = 0, new_m = 0;
+            if (!parse_time_hh_mm(time_str, new_h, new_m)) {
+                rpc_client_.send_group_msg(event.group_id, "✕ | 时间格式错误，请使用 HH:MM 格式 (如 06:00)");
+                return true;
+            }
+
+            db_.set_daily_update_time(new_h, new_m);
+            char buf[16];
+            std::snprintf(buf, sizeof(buf), "%02d:%02d", new_h, new_m);
+            rpc_client_.send_group_msg(event.group_id, "➥ | 日推更新时间已更改至 " + std::string(buf));
+            return true;
         } else if (sub_arg == "状态" || sub_arg == "status") {
             bool enabled = db_.is_daily_music_enabled(event.group_id);
-            std::string today_str = DailyMusicManager::get_current_date_str();
-            auto today_push = db_.get_today_daily_push(event.group_id, today_str);
-            auto latest = today_push.has_value() ? today_push : db_.get_latest_daily_push(event.group_id);
-            std::string msg = "┏ 每日音乐推荐状态 ━\n";
-            msg += "┃状态：" + std::string(enabled ? "已开启" : "未开启 (可回复 /日推 开启)") + "\n";
-            if (latest.has_value()) {
-                auto [up, down] = db_.get_daily_push_votes(latest->message_id);
-                msg += "┃今日/最新：「" + latest->item_name + "」- " + latest->artist_name + "\n";
-                msg += "┃投票反馈：👍 " + std::to_string(up) + " / 👎 " + std::to_string(down) + "\n";
-                msg += "┃评价状态：" + std::string(latest->evaluated ? "已结算" : "待 23:00 结算") + "\n";
-            } else {
-                msg += "┃今日/最新：暂无推送记录\n";
+            if (!enabled) {
+                rpc_client_.send_group_msg(event.group_id, "𝐢 | 当前日推功能未开启");
+                return true;
             }
-            msg += "┃推送时刻：每天 11:00\n";
-            msg += "┃评价时刻：每天 23:00";
+
+            auto time_cfg = db_.get_daily_music_time_config();
+            std::string today_str = DailyMusicManager::get_current_date_str(time_cfg.update_hour, time_cfg.update_minute);
+            auto today_push = db_.get_today_daily_push(event.group_id, today_str);
+
+            std::string msg = "❐ | 每日音乐推荐状态\n";
+            msg += "今日音乐推荐：\n";
+
+            if (today_push.has_value() && today_push->message_id > 0) {
+                msg += "「" + today_push->item_name + "」- " + today_push->artist_name + "\n";
+                auto [up, down] = today_push->evaluated ?
+                    std::pair<int, int>{today_push->upvotes, today_push->downvotes} :
+                    db_.get_daily_push_votes(today_push->message_id);
+                msg += "投票反馈：👍 " + std::to_string(up) + " / 👎 " + std::to_string(down) + "\n";
+
+                if (today_push->evaluated) {
+                    msg += "评价状态：<已结束评价>\n";
+                } else {
+                    char eval_buf[16];
+                    std::snprintf(eval_buf, sizeof(eval_buf), "%02d:%02d", time_cfg.eval_hour, time_cfg.eval_minute);
+                    msg += "评价状态：待 " + std::string(eval_buf) + " 结算\n";
+                }
+
+                std::time_t pushed_t = today_push->pushed_at;
+                std::tm push_tm{};
+#if defined(_WIN32)
+                localtime_s(&push_tm, &pushed_t);
+#else
+                localtime_r(&pushed_t, &push_tm);
+#endif
+                char push_buf[16];
+                std::snprintf(push_buf, sizeof(push_buf), "%02d:%02d", push_tm.tm_hour, push_tm.tm_min);
+                msg += "推送时间：" + std::string(push_buf);
+            } else {
+                msg += "<今日暂未推送>\n";
+                msg += "投票反馈：👍 0 / 👎 0\n";
+                char eval_buf[16];
+                std::snprintf(eval_buf, sizeof(eval_buf), "%02d:%02d", time_cfg.eval_hour, time_cfg.eval_minute);
+                msg += "评价状态：待 " + std::string(eval_buf) + " 结算\n";
+                msg += "推送时间：<今日暂未推送>";
+            }
+
             rpc_client_.send_group_msg(event.group_id, msg);
             return true;
         } else if (sub_arg == "结算" || sub_arg == "eval") {
-            std::string today_str = DailyMusicManager::get_current_date_str();
+            auto time_cfg = db_.get_daily_music_time_config();
+            std::string today_str = DailyMusicManager::get_current_date_str(time_cfg.update_hour, time_cfg.update_minute);
             if (db_.is_daily_evaluated(event.group_id, today_str)) {
                 rpc_client_.send_group_msg(event.group_id, "𝐢 | 当日日推评价已结算");
                 return true;
             }
-            daily_manager_->trigger_eval_now();
+            daily_manager_->trigger_eval_now("", event.group_id);
             db_.set_daily_evaluated(event.group_id, today_str);
             rpc_client_.send_group_msg(event.group_id, "➥ | 已手动执行日推评价结算");
             return true;
         } else if (sub_arg == "重置" || sub_arg == "恢复" || sub_arg == "reset") {
-            std::string today_str = DailyMusicManager::get_current_date_str();
+            auto time_cfg = db_.get_daily_music_time_config();
+            auto [now_h, now_m] = DailyMusicManager::get_current_time_hm();
+            int now_offset = get_cycle_offset_minutes(now_h, now_m, time_cfg.update_hour, time_cfg.update_minute);
+            int eval_offset = get_cycle_offset_minutes(time_cfg.eval_hour, time_cfg.eval_minute, time_cfg.update_hour, time_cfg.update_minute);
+
+            if (now_offset >= eval_offset) {
+                rpc_client_.send_group_msg(event.group_id, "✕ | 已过日推默认结算时间，不可进行重置");
+                return true;
+            }
+
+            std::string today_str = DailyMusicManager::get_current_date_str(time_cfg.update_hour, time_cfg.update_minute);
             db_.reset_daily_push_status(event.group_id, today_str);
-            rpc_client_.send_group_msg(event.group_id, "➥ | 已恢复当日日推状态为初始状态");
+            rpc_client_.send_group_msg(event.group_id, "➥ | 已重置日推功能");
             return true;
         } else {
-            std::string today_str = DailyMusicManager::get_current_date_str();
+            auto time_cfg = db_.get_daily_music_time_config();
+            std::string today_str = DailyMusicManager::get_current_date_str(time_cfg.update_hour, time_cfg.update_minute);
             auto today_push = db_.get_today_daily_push(event.group_id, today_str);
             if (today_push.has_value() && today_push->message_id > 0) {
                 // 后续触发：QQ群内对第一条日推信息（即转发的音乐）进行引用（回复）
@@ -1444,6 +1681,50 @@ bool MusicModule::handle_private_message(const bot::protocol::PrivateMessageEven
         text.erase(0, 1);
     }
 
+    // 0. 优先检查并处理跨群共享账号的二次确认 (覆盖 / 取消)
+    {
+        std::lock_guard<std::mutex> lock(shares_mutex_);
+        auto it = pending_shares_.find(event.user_id);
+        if (it != pending_shares_.end()) {
+            auto now = std::chrono::steady_clock::now();
+            if (now > it->second.expire_at) {
+                pending_shares_.erase(it);
+            } else {
+                auto conf = it->second;
+                if (text == "覆盖" || text == "/覆盖" || text == ".覆盖") {
+                    pending_shares_.erase(it);
+                    auto src_acc = db_.get_group_netease_account(conf.src_group);
+                    if (!src_acc.has_value() || src_acc->cookie.empty()) {
+                        rpc_client_.send_private_msg(event.user_id, "✕ | 被共享群未登录网易云账号");
+                        return true;
+                    }
+
+                    int slot = db_.allocate_account_slot(src_acc->account_uid, conf.dest_group, NeteasePlatformConfig::MAX_RECOMMEND_SLOTS);
+                    if (slot < 0) {
+                        rpc_client_.send_private_msg(event.user_id, "✕ | 共享该账号的群聊数量达到上限。");
+                        return true;
+                    }
+
+                    // 清除 dest群 原账号的相关记录与今日日推记录，建立共享绑定并回复成功
+                    db_.clear_group_netease_account(conf.dest_group);
+                    std::string today_str = DailyMusicManager::get_current_date_str();
+                    db_.reset_daily_push_status(conf.dest_group, today_str);
+                    bool ok = db_.share_group_netease_account(conf.dest_group, conf.src_group, slot);
+                    if (ok) {
+                        rpc_client_.send_private_msg(event.user_id, "➥ | 账号共享成功！群 " + std::to_string(conf.dest_group) + " 已成功共享群 " + std::to_string(conf.src_group) + " 的网易云账号");
+                    } else {
+                        rpc_client_.send_private_msg(event.user_id, "✕ | 共享账号失败，请检查数据库状态");
+                    }
+                    return true;
+                } else if (text == "取消" || text == "/取消" || text == ".取消" || text == "cancel" || text == "/cancel") {
+                    pending_shares_.erase(it);
+                    rpc_client_.send_private_msg(event.user_id, "➥ | 操作已取消");
+                    return true;
+                }
+            }
+        }
+    }
+
     // 1. 取消正在进行的扫码登录
     if (text == "取消" || text == "/取消" || text == ".取消" || text == "cancel" || text == "/cancel") {
         if (qr_session_ && qr_session_->user_id == event.user_id) {
@@ -1456,6 +1737,8 @@ bool MusicModule::handle_private_message(const bot::protocol::PrivateMessageEven
     bool is_admin_cmd = (text == "/管理员" || text == ".管理员" || text == "/admin" || text == ".admin" ||
                          text.rfind("/管理员", 0) == 0 || text.rfind(".管理员", 0) == 0 ||
                          text.rfind("/admin", 0) == 0 || text.rfind(".admin", 0) == 0);
+    bool is_share_cmd = (text == "/共享账号" || text == ".共享账号" ||
+                         text.rfind("/共享账号", 0) == 0 || text.rfind(".共享账号", 0) == 0);
     bool is_login_cmd = (text == "/登录" || text == ".登录" || text == "/login" || text == ".login" ||
                          text == "/网易云登录" || text == ".网易云登录" || text == "/扫码登录" || text == ".扫码登录" ||
                          text == "/cookie" || text == ".cookie" || text == "/设置cookie" || text == ".设置cookie" ||
@@ -1464,18 +1747,24 @@ bool MusicModule::handle_private_message(const bot::protocol::PrivateMessageEven
                          text.rfind("/cookie", 0) == 0 || text.rfind(".cookie", 0) == 0 ||
                          text.rfind("/设置cookie", 0) == 0 || text.rfind(".设置cookie", 0) == 0);
     bool is_status_cmd = (text == "/账号状态" || text == ".账号状态" || text == "/登录状态" || text == ".登录状态" ||
-                          text == "/status" || text == ".status");
+                          text == "/status" || text == ".status" ||
+                          text.rfind("/账号状态", 0) == 0 || text.rfind(".账号状态", 0) == 0 ||
+                          text.rfind("/登录状态", 0) == 0 || text.rfind(".登录状态", 0) == 0 ||
+                          text.rfind("/status", 0) == 0 || text.rfind(".status", 0) == 0);
     bool is_logout_cmd = (text == "/退出登录" || text == ".退出登录" || text == "/注销" || text == ".注销" ||
-                          text == "/logout" || text == ".logout");
+                          text == "/logout" || text == ".logout" ||
+                          text.rfind("/退出登录", 0) == 0 || text.rfind(".退出登录", 0) == 0 ||
+                          text.rfind("/注销", 0) == 0 || text.rfind(".注销", 0) == 0 ||
+                          text.rfind("/logout", 0) == 0 || text.rfind(".logout", 0) == 0);
 
     // 若不是本模块支持的私聊指令，直接放行
-    if (!is_admin_cmd && !is_login_cmd && !is_status_cmd && !is_logout_cmd) {
+    if (!is_admin_cmd && !is_share_cmd && !is_login_cmd && !is_status_cmd && !is_logout_cmd) {
         return false;
     }
 
     // 2. 超级管理员首登机制：若当前数据库无任何管理员，首位发送 /登录 或 /管理员 的私聊用户静默成为初始超级管理员
     bool has_admins = db_.has_any_admin();
-    if (!has_admins && (is_admin_cmd || is_login_cmd)) {
+    if (!has_admins && (is_admin_cmd || is_login_cmd || is_share_cmd)) {
         db_.add_admin(event.user_id);
     }
 
@@ -1563,80 +1852,205 @@ bool MusicModule::handle_private_message(const bot::protocol::PrivateMessageEven
             help += "┃• /管理员 列表 - 查看管理员名单\n";
             help += "┃• /管理员 添加 <QQ> - 添加管理员\n";
             help += "┃• /管理员 删除 <QQ> - 移除管理员\n";
-            help += "┃• /登录 - 扫码登录网易云音乐\n";
-            help += "┃• /登录 <Cookie> - 导入Cookie凭据\n";
-            help += "┃• /账号状态 - 查看网易云登录态\n";
-            help += "┃• /退出登录 - 退出当前网易云登录";
+            help += "┃• /登录 <QQ群号> - 扫码为指定群登录网易云\n";
+            help += "┃• /登录 <QQ群号> <Cookie> - 导入Cookie凭据\n";
+            help += "┃• /账号状态 <QQ群号> - 查看群网易云登录态\n";
+            help += "┃• /退出登录 <QQ群号> - 退出群网易云登录\n";
+            help += "┃• /共享账号 <dest群> <src群> - 跨群共享账号";
             rpc_client_.send_private_msg(event.user_id, help);
             return true;
         }
     }
 
-    // 4. 扫码登录或直接导入 Cookie 命令：/登录 或 /login
+    // 4. 共享账号命令：/共享账号 <dest群号> <src群号>
+    if (is_share_cmd) {
+        if (!is_admin) {
+            rpc_client_.send_private_msg(event.user_id, "✕ | 权限不足：仅限管理员配置账号共享");
+            return true;
+        }
+
+        std::string sub_arg;
+        if (text.rfind("/共享账号", 0) == 0) sub_arg = trim(text.substr(std::string("/共享账号").length()));
+        else if (text.rfind(".共享账号", 0) == 0) sub_arg = trim(text.substr(std::string(".共享账号").length()));
+
+        std::istringstream iss(sub_arg);
+        std::string dest_str, src_str;
+        iss >> dest_str >> src_str;
+
+        if (dest_str.empty() || src_str.empty()) {
+            rpc_client_.send_private_msg(event.user_id, "𝐢 | 用法：/共享账号 <dest群号> <src群号>");
+            return true;
+        }
+
+        int64_t dest_group = 0, src_group = 0;
+        try {
+            dest_group = std::stoll(dest_str);
+            src_group = std::stoll(src_str);
+        } catch (...) {
+            rpc_client_.send_private_msg(event.user_id, "𝐢 | 用法：/共享账号 <dest群号> <src群号>");
+            return true;
+        }
+
+        if (dest_group <= 10000 || src_group <= 10000) {
+            rpc_client_.send_private_msg(event.user_id, "𝐢 | 用法：/共享账号 <dest群号> <src群号>");
+            return true;
+        }
+
+        if (dest_group == src_group) {
+            rpc_client_.send_private_msg(event.user_id, "✕ | 目标群与源群不能相同");
+            return true;
+        }
+
+        // 机器人先判断自己是否在目标群里
+        if (!is_bot_in_group(dest_group)) {
+            rpc_client_.send_private_msg(event.user_id, "✕ | 机器人未入群不可为该群添加网易云账号");
+            return true;
+        }
+
+        // 检查源群是否已登录网易云账号
+        auto src_acc = db_.get_group_netease_account(src_group);
+        if (!src_acc.has_value() || src_acc->cookie.empty()) {
+            rpc_client_.send_private_msg(event.user_id, "✕ | 被共享群未登录网易云账号");
+            return true;
+        }
+
+        // 在共享群发起共享前进行拦截检查上限
+        int slot = db_.allocate_account_slot(src_acc->account_uid, dest_group, NeteasePlatformConfig::MAX_RECOMMEND_SLOTS);
+        if (slot < 0) {
+            rpc_client_.send_private_msg(event.user_id, "✕ | 共享该账号的群聊数量达到上限。");
+            return true;
+        }
+
+        // 检查 dest群 是否已有账号绑定
+        auto dest_acc = db_.get_group_netease_account(dest_group);
+        if (dest_acc.has_value() && !dest_acc->cookie.empty()) {
+            std::lock_guard<std::mutex> lock(shares_mutex_);
+            PendingShareConfirm conf;
+            conf.user_id = event.user_id;
+            conf.dest_group = dest_group;
+            conf.src_group = src_group;
+            conf.expire_at = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+            pending_shares_[event.user_id] = conf;
+
+            std::string prompt = "❐ | 目标群当前已绑定网易云账号\n"
+                                 "是否覆盖现有账号绑定？\n"
+                                 "➫ 请回复「覆盖」或「取消」";
+            rpc_client_.send_private_msg(event.user_id, prompt);
+            return true;
+        }
+
+        // dest群 原本没有账号，直接建立共享绑定
+        bool ok = db_.share_group_netease_account(dest_group, src_group, slot);
+        if (ok) {
+            rpc_client_.send_private_msg(event.user_id, "➥ | 账号共享成功！群 " + std::to_string(dest_group) + " 已成功共享群 " + std::to_string(src_group) + " 的网易云账号");
+        } else {
+            rpc_client_.send_private_msg(event.user_id, "✕ | 共享账号失败，请检查数据库状态");
+        }
+        return true;
+    }
+
+    // 5. 扫码登录或直接导入 Cookie 命令：/登录 <QQ群号> [Cookie]
     if (is_login_cmd) {
         if (!is_admin) {
             rpc_client_.send_private_msg(event.user_id, "✕ | 权限不足：仅限管理员登录网易云音乐账号，如需授权请联系管理员");
             return true;
         }
 
-        std::string arg;
+        std::string full_arg;
         const std::vector<std::string> prefixes = {
             "/设置cookie", ".设置cookie", "/网易云登录", ".网易云登录", "/扫码登录", ".扫码登录",
             "/cookie", ".cookie", "/登录", ".登录", "/login", ".login"
         };
         for (const auto& prefix : prefixes) {
             if (text.rfind(prefix, 0) == 0) {
-                arg = trim(text.substr(prefix.size()));
+                full_arg = trim(text.substr(prefix.size()));
                 break;
             }
         }
 
-        // 如果用户提供了 Cookie 参数 (例如 /登录 MUSIC_U=xxxx)
-        if (!arg.empty()) {
-            if (arg.find("MUSIC_U") != std::string::npos) {
-                // 清洗 Cookie，提取干净的键值并滤除用户输入中残留的中文或非 ASCII 字符
+        if (full_arg.empty()) {
+            rpc_client_.send_private_msg(event.user_id, "𝐢 | 用法：/登录 <QQ群号> [Cookie]");
+            return true;
+        }
+
+        std::istringstream iss(full_arg);
+        std::string group_str;
+        iss >> group_str;
+
+        int64_t target_group = 0;
+        try {
+            target_group = std::stoll(group_str);
+        } catch (...) {
+            rpc_client_.send_private_msg(event.user_id, "𝐢 | 用法：/登录 <QQ群号> [Cookie]");
+            return true;
+        }
+
+        if (target_group <= 10000) {
+            rpc_client_.send_private_msg(event.user_id, "𝐢 | 用法：/登录 <QQ群号> [Cookie]");
+            return true;
+        }
+
+        // 机器人先判断自己是否在这个群里
+        if (!is_bot_in_group(target_group)) {
+            rpc_client_.send_private_msg(event.user_id, "✕ | 机器人未入群不可为该群添加网易云账号");
+            return true;
+        }
+
+        std::string cookie_arg = trim(full_arg.substr(group_str.size()));
+
+        if (!cookie_arg.empty()) {
+            if (cookie_arg.find("MUSIC_U") != std::string::npos) {
                 std::string clean_cookie;
-                auto u_pos = arg.find("MUSIC_U=");
+                auto u_pos = cookie_arg.find("MUSIC_U=");
                 if (u_pos != std::string::npos) {
                     size_t v_start = u_pos + 8;
                     size_t v_end = v_start;
-                    while (v_end < arg.size() && (std::isalnum(static_cast<unsigned char>(arg[v_end])) ||
-                                                  arg[v_end] == '_' || arg[v_end] == '-' ||
-                                                  arg[v_end] == '%' || arg[v_end] == '.')) {
+                    while (v_end < cookie_arg.size() && (std::isalnum(static_cast<unsigned char>(cookie_arg[v_end])) ||
+                                                  cookie_arg[v_end] == '_' || cookie_arg[v_end] == '-' ||
+                                                  cookie_arg[v_end] == '%' || cookie_arg[v_end] == '.')) {
                         v_end++;
                     }
-                    clean_cookie = "MUSIC_U=" + arg.substr(v_start, v_end - v_start);
+                    clean_cookie = "MUSIC_U=" + cookie_arg.substr(v_start, v_end - v_start);
                 } else {
-                    clean_cookie = arg;
+                    clean_cookie = cookie_arg;
                 }
 
-                auto csrf_pos = arg.find("__csrf=");
+                auto csrf_pos = cookie_arg.find("__csrf=");
                 if (csrf_pos != std::string::npos) {
                     size_t c_start = csrf_pos + 7;
                     size_t c_end = c_start;
-                    while (c_end < arg.size() && (std::isalnum(static_cast<unsigned char>(arg[c_end])) ||
-                                                  arg[c_end] == '_' || arg[c_end] == '-')) {
+                    while (c_end < cookie_arg.size() && (std::isalnum(static_cast<unsigned char>(cookie_arg[c_end])) ||
+                                                  cookie_arg[c_end] == '_' || cookie_arg[c_end] == '-')) {
                         c_end++;
                     }
-                    std::string csrf_val = arg.substr(c_start, c_end - c_start);
+                    std::string csrf_val = cookie_arg.substr(c_start, c_end - c_start);
                     if (!csrf_val.empty()) {
                         clean_cookie += "; __csrf=" + csrf_val;
                     }
                 }
 
-                netease_->set_cookie(clean_cookie);
-                db_.set_config("netease_cookie", clean_cookie);
                 cancel_qr_login_session();
 
-                auto status = netease_->check_login_status();
+                auto status = netease_->check_login_status(clean_cookie);
                 if (status.is_logged_in) {
+                    int slot = db_.allocate_account_slot(status.user_id, target_group, NeteasePlatformConfig::MAX_RECOMMEND_SLOTS);
+                    if (slot < 0) {
+                        db_.clear_group_netease_account(target_group);
+                        rpc_client_.send_private_msg(event.user_id, "✕ | 共享该账号的群聊数量达到上限。");
+                        return true;
+                    }
+
+                    db_.set_group_netease_account(target_group, clean_cookie, status.nickname, status.user_id, status.is_vip, slot);
+                    netease_->set_cookie(clean_cookie);
+                    db_.set_config("netease_cookie", clean_cookie);
+
                     std::string vip_str = status.is_vip ? "VIP用户" : "普通用户";
                     std::string msg = "登录成功！\n";
                     msg += "方式：Cookie导入\n";
                     msg += "当前账号：" + status.nickname + "（UID：" + std::to_string(status.user_id) + "）\n";
                     msg += vip_str;
                     rpc_client_.send_private_msg(event.user_id, msg);
-                    std::cout << "[MusicModule] Admin UID " << event.user_id << " imported valid NetEase cookie (User: " << status.nickname << ", UID: " << status.user_id << ", VIP: " << (status.is_vip ? "YES" : "NO") << ")." << std::endl;
+                    std::cout << "[MusicModule] Admin UID " << event.user_id << " imported valid NetEase cookie for group " << target_group << " (User: " << status.nickname << ", UID: " << status.user_id << ", VIP: " << (status.is_vip ? "YES" : "NO") << ")." << std::endl;
                 } else {
                     std::string msg = "登录失败！\n";
                     msg += "原因：该 Cookie 凭据未通过网易云服务器鉴权 (account: null)\n";
@@ -1654,25 +2068,54 @@ bool MusicModule::handle_private_message(const bot::protocol::PrivateMessageEven
             }
         }
 
-        start_qr_login_session(event.user_id);
+        start_qr_login_session(event.user_id, target_group);
         return true;
     }
 
-    // 5. 账号状态查询命令
+    // 6. 账号状态查询命令：/账号状态 <QQ群号>
     if (is_status_cmd) {
-        std::string cookie = netease_->get_cookie();
-        if (cookie.empty()) {
-            cookie = db_.get_config("netease_cookie");
-            if (!cookie.empty()) {
-                netease_->set_cookie(cookie);
+        std::string sub_arg;
+        const std::vector<std::string> prefixes = {
+            "/账号状态", ".账号状态", "/登录状态", ".登录状态", "/status", ".status"
+        };
+        for (const auto& prefix : prefixes) {
+            if (text.rfind(prefix, 0) == 0) {
+                sub_arg = trim(text.substr(prefix.size()));
+                break;
             }
         }
+
+        if (sub_arg.empty()) {
+            rpc_client_.send_private_msg(event.user_id, "𝐢 | 用法：/账号状态 <QQ群号>");
+            return true;
+        }
+
+        int64_t target_group = 0;
+        try {
+            target_group = std::stoll(sub_arg);
+        } catch (...) {
+            rpc_client_.send_private_msg(event.user_id, "𝐢 | 用法：/账号状态 <QQ群号>");
+            return true;
+        }
+
+        if (target_group <= 10000) {
+            rpc_client_.send_private_msg(event.user_id, "𝐢 | 用法：/账号状态 <QQ群号>");
+            return true;
+        }
+
+        if (!is_bot_in_group(target_group)) {
+            rpc_client_.send_private_msg(event.user_id, "✕ | 机器人未入群不可为该群添加网易云账号");
+            return true;
+        }
+
+        auto acc_opt = db_.get_group_netease_account(target_group);
+        std::string cookie = acc_opt.has_value() ? acc_opt->cookie : "";
         if (cookie.empty() || cookie.find("MUSIC_U") == std::string::npos) {
             rpc_client_.send_private_msg(event.user_id, "登录态：未登录\n➫ 请管理员私聊机器人登录账号进行授权");
             return true;
         }
 
-        auto status = netease_->check_login_status();
+        auto status = netease_->check_login_status(cookie);
         if (status.is_logged_in) {
             std::string vip_str = status.is_vip ? "VIP用户" : "普通用户";
             std::string msg = "登录态：已登录\n";
@@ -1685,14 +2128,48 @@ bool MusicModule::handle_private_message(const bot::protocol::PrivateMessageEven
         return true;
     }
 
-    // 6. 退出登录命令
+    // 7. 退出登录命令：/退出登录 <QQ群号>
     if (is_logout_cmd) {
         if (!is_admin) {
             rpc_client_.send_private_msg(event.user_id, "✕ | 权限不足：仅限管理员执行该操作");
             return true;
         }
-        netease_->set_cookie("");
-        db_.set_config("netease_cookie", "");
+
+        std::string sub_arg;
+        const std::vector<std::string> prefixes = {
+            "/退出登录", ".退出登录", "/注销", ".注销", "/logout", ".logout"
+        };
+        for (const auto& prefix : prefixes) {
+            if (text.rfind(prefix, 0) == 0) {
+                sub_arg = trim(text.substr(prefix.size()));
+                break;
+            }
+        }
+
+        if (sub_arg.empty()) {
+            rpc_client_.send_private_msg(event.user_id, "𝐢 | 用法：/退出登录 <QQ群号>");
+            return true;
+        }
+
+        int64_t target_group = 0;
+        try {
+            target_group = std::stoll(sub_arg);
+        } catch (...) {
+            rpc_client_.send_private_msg(event.user_id, "𝐢 | 用法：/退出登录 <QQ群号>");
+            return true;
+        }
+
+        if (target_group <= 10000) {
+            rpc_client_.send_private_msg(event.user_id, "𝐢 | 用法：/退出登录 <QQ群号>");
+            return true;
+        }
+
+        if (!is_bot_in_group(target_group)) {
+            rpc_client_.send_private_msg(event.user_id, "✕ | 机器人未入群不可为该群添加网易云账号");
+            return true;
+        }
+
+        db_.clear_group_netease_account(target_group);
         rpc_client_.send_private_msg(event.user_id, "➥ | 已清除网易云账号登录凭据并退出登录");
         return true;
     }
@@ -1700,7 +2177,7 @@ bool MusicModule::handle_private_message(const bot::protocol::PrivateMessageEven
     return false;
 }
 
-void MusicModule::start_qr_login_session(int64_t user_id) {
+void MusicModule::start_qr_login_session(int64_t user_id, int64_t target_group) {
     cancel_qr_login_session();
 
     auto key_res = netease_->get_qr_key();
@@ -1712,6 +2189,7 @@ void MusicModule::start_qr_login_session(int64_t user_id) {
 
     qr_session_ = std::make_unique<QrLoginSession>();
     qr_session_->user_id = user_id;
+    qr_session_->target_group = target_group;
     qr_session_->unikey = key_res.unikey;
     qr_session_->poll_count = 0;
     qr_session_->prompted_confirm = false;
@@ -1756,6 +2234,7 @@ void MusicModule::on_qr_poll_timer(const boost::system::error_code& ec) {
     auto check_res = netease_->check_qr_login(qr_session_->unikey);
     if (check_res.code == 803) {
         int64_t uid = qr_session_->user_id;
+        int64_t target_group = qr_session_->target_group;
         std::string cookie = check_res.cookie;
         if (cookie.empty()) {
             cookie = netease_->get_cookie();
@@ -1766,10 +2245,21 @@ void MusicModule::on_qr_poll_timer(const boost::system::error_code& ec) {
         }
         cancel_qr_login_session();
 
-        auto status = netease_->check_login_status();
+        auto status = netease_->check_login_status(cookie);
         std::string nick = (status.is_logged_in && !status.nickname.empty()) ? status.nickname : (!check_res.nickname.empty() ? check_res.nickname : qr_session_->nickname);
-        std::string uid_str = (status.is_logged_in && status.user_id > 0) ? std::to_string(status.user_id) : std::to_string(uid);
+        int64_t acc_uid = (status.is_logged_in && status.user_id > 0) ? status.user_id : 0;
+        std::string uid_str = acc_uid > 0 ? std::to_string(acc_uid) : std::to_string(uid);
         std::string vip_str = status.is_vip ? "VIP用户" : "普通用户";
+
+        if (!cookie.empty() && target_group > 0) {
+            int slot = db_.allocate_account_slot(acc_uid, target_group, NeteasePlatformConfig::MAX_RECOMMEND_SLOTS);
+            if (slot < 0) {
+                db_.clear_group_netease_account(target_group);
+                rpc_client_.send_private_msg(uid, "✕ | 共享该账号的群聊数量达到上限。");
+                return;
+            }
+            db_.set_group_netease_account(target_group, cookie, nick, acc_uid, status.is_vip, slot);
+        }
 
         std::string success_msg = "登录成功！\n";
         success_msg += "方式：扫码登录\n";
@@ -1778,6 +2268,7 @@ void MusicModule::on_qr_poll_timer(const boost::system::error_code& ec) {
         rpc_client_.send_private_msg(uid, success_msg);
 
         std::cout << "[MusicModule] QR login successfully finalized for UID: " << uid
+                  << ", target_group: " << target_group
                   << ", cookie length: " << cookie.size()
                   << ", has_MUSIC_U=" << (cookie.find("MUSIC_U") != std::string::npos ? "YES" : "NO")
                   << std::endl;

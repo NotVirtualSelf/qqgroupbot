@@ -99,9 +99,10 @@ public:
     /**
      * @brief 手动或即时触发一次评价结算
      * @param task_name 指定任务名（为空表示匹配所有任务）
+     * @param target_group 目标群号（0 表示结算所有未结算群聊，非0仅结算该指定群）
      * @return bool 是否成功触发
      */
-    bool trigger_eval_now(const std::string& task_name = "");
+    bool trigger_eval_now(const std::string& task_name = "", int64_t target_group = 0);
 
     /**
      * @brief 记录某条日推消息与元数据 (供测试或上层即时推送复用)
@@ -120,12 +121,13 @@ public:
      * @param recommender 推荐器实例
      * @param item 推荐内容
      * @param upvotes 点赞票数
-     * @param downvotes 踩票数
+     * @param cookie 可选网易云账号 Cookie 凭据
      * @return DailyEvalAction 最终执行的评价动作 (Like / Dislike / None)
      */
     DailyEvalAction evaluate_item_votes(const std::shared_ptr<IDailyRecommender>& recommender,
                                         const DailyRecommendationItem& item,
-                                        int upvotes, int downvotes);
+                                        int upvotes, int downvotes,
+                                        const std::string& cookie = "");
 
     /**
      * @brief 计算当前时刻距离下一个目标时刻 (hour:min:00) 的等待秒数
@@ -136,10 +138,33 @@ public:
     static std::chrono::seconds calculate_delay_until(int target_hour, int target_minute);
 
     /**
-     * @brief 获取当前日期字符串 (格式: YYYY-MM-DD)
-     * @return std::string 当天日期字符串
+     * @brief 动态调整并更新定时任务的推送与结算时间，即刻重新调度定时器
+     * @param push_h 推送小时 (0~23)
+     * @param push_m 推送分钟 (0~59)
+     * @param eval_h 结算小时 (0~23)
+     * @param eval_m 结算分钟 (0~59)
      */
-    static std::string get_current_date_str();
+    void update_schedule_times(int push_h, int push_m, int eval_h, int eval_m);
+
+    /**
+     * @brief 获取当前日推周期日期字符串 (格式: YYYY-MM-DD)
+     * @param update_hour 日推更新时间小时 (默认 6:00)
+     * @param update_minute 日推更新时间分钟
+     * @return std::string 周期日期字符串
+     */
+    static std::string get_current_date_str(int update_hour = NeteasePlatformConfig::RESET_HOUR, int update_minute = NeteasePlatformConfig::RESET_MINUTE);
+
+    /**
+     * @brief 获取当前小时和分钟 (用于业务逻辑判断，支持单元测试 mock)
+     * @return std::pair<int, int> (hour, minute)
+     */
+    static std::pair<int, int> get_current_time_hm();
+
+    /**
+     * @brief 单元测试专用的模拟当前时间设置 (传入 std::nullopt 恢复系统真实时间)
+     * @param mock_hm 模拟的小时和分钟
+     */
+    static void set_mock_time(std::optional<std::pair<int, int>> mock_hm);
 
 private:
     void schedule_push_for_task(RecommenderTaskContext& task_ctx);
@@ -149,7 +174,7 @@ private:
     void on_eval_timer(RecommenderTaskContext* task_ctx, const boost::system::error_code& ec);
 
     bool execute_push(const std::shared_ptr<IDailyRecommender>& recommender, int64_t target_group = 0);
-    bool execute_eval(const std::shared_ptr<IDailyRecommender>& recommender);
+    bool execute_eval(const std::shared_ptr<IDailyRecommender>& recommender, int64_t target_group = 0);
 
     boost::asio::io_context& ioc_;
     bot::protocol::RpcClient& rpc_client_;

@@ -183,13 +183,13 @@ public:
     std::optional<AlbumDetail> get_album_detail(int64_t album_id);
 
     /// 获取每日推荐歌曲列表 (日推需登录 Cookie)
-    std::vector<DailySongItem> get_daily_recommend_songs();
+    std::vector<DailySongItem> get_daily_recommend_songs(const std::string& cookie = "");
 
     /// 喜欢/点赞歌曲 (like=true 为喜欢，false 为取消喜欢)
-    bool like_song(int64_t song_id, bool like = true);
+    bool like_song(int64_t song_id, bool like = true, const std::string& cookie = "");
 
     /// 日推减少推荐某歌曲 (Dislike / 踩 / 不感兴趣)
-    bool dislike_recommend_song(int64_t song_id);
+    bool dislike_recommend_song(int64_t song_id, const std::string& cookie = "");
 
     /// 获取网易云扫码登录 unikey 与登录 URL
     QrKeyResult get_qr_key();
@@ -198,7 +198,7 @@ public:
     QrCheckResult check_qr_login(const std::string& unikey);
 
     /// 检查当前网易云登录凭据状态 (向网易云服务器验证账号登录态)
-    LoginStatus check_login_status();
+    LoginStatus check_login_status(const std::string& cookie = "");
 
     /// 生成二维码图片并返回 Base64 编码 (若 output_png_path 非空则同时保存到该文件)
     static std::string generate_qr_image_base64(const std::string& text, const std::string& output_png_path = "");
@@ -230,7 +230,7 @@ public:
     HttpResult http_post_detailed(const std::string& url, const std::string& post_data);
 
     /// 执行网易云 Web 客户端专属 weapi 加密 POST 请求
-    std::string weapi_post(const std::string& url, const std::string& json_payload);
+    std::string weapi_post(const std::string& url, const std::string& json_payload, const std::string& cookie = "");
 
 private:
     std::string custom_api_base_;

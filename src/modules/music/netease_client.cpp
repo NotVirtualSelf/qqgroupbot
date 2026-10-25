@@ -765,7 +765,7 @@ std::optional<AlbumDetail> NeteaseClient::get_album_detail(int64_t album_id) {
     return detail;
 }
 
-std::vector<DailySongItem> NeteaseClient::get_daily_recommend_songs() {
+std::vector<DailySongItem> NeteaseClient::get_daily_recommend_songs(const std::string& cookie) {
     if (!mock_daily_songs_.empty()) {
         return mock_daily_songs_;
     }
@@ -775,7 +775,7 @@ std::vector<DailySongItem> NeteaseClient::get_daily_recommend_songs() {
         std::string url = custom_api_base_ + "/recommend/songs";
         json_body = http_get(url);
     } else {
-        json_body = weapi_post("https://music.163.com/weapi/v3/discovery/recommend/songs", "{\"csrf_token\":\"\"}");
+        json_body = weapi_post("https://music.163.com/weapi/v3/discovery/recommend/songs", "{\"csrf_token\":\"\"}", cookie);
         if (json_body.empty()) {
             // 降级尝试公开推荐接口
             json_body = http_get("https://music.163.com/api/v3/discovery/recommend/songs");
@@ -831,7 +831,7 @@ std::vector<DailySongItem> NeteaseClient::get_daily_recommend_songs() {
     return result;
 }
 
-bool NeteaseClient::like_song(int64_t song_id, bool like) {
+bool NeteaseClient::like_song(int64_t song_id, bool like, const std::string& cookie) {
     if (song_id <= 0) return false;
 
     std::string json_body;
@@ -840,7 +840,7 @@ bool NeteaseClient::like_song(int64_t song_id, bool like) {
         json_body = http_get(url);
     } else {
         std::string payload = "{\"trackId\":" + std::to_string(song_id) + ",\"like\":" + (like ? "true" : "false") + ",\"csrf_token\":\"\"}";
-        json_body = weapi_post("https://music.163.com/weapi/radio/like?alg=itembased&trackId=" + std::to_string(song_id) + "&like=" + (like ? "true" : "false") + "&time=25", payload);
+        json_body = weapi_post("https://music.163.com/weapi/radio/like?alg=itembased&trackId=" + std::to_string(song_id) + "&like=" + (like ? "true" : "false") + "&time=25", payload, cookie);
     }
 
     if (json_body.empty()) {
@@ -858,7 +858,7 @@ bool NeteaseClient::like_song(int64_t song_id, bool like) {
     return false;
 }
 
-bool NeteaseClient::dislike_recommend_song(int64_t song_id) {
+bool NeteaseClient::dislike_recommend_song(int64_t song_id, const std::string& cookie) {
     if (song_id <= 0) return false;
 
     std::string json_body;
@@ -867,7 +867,7 @@ bool NeteaseClient::dislike_recommend_song(int64_t song_id) {
         json_body = http_get(url);
     } else {
         std::string payload = "{\"songId\":\"" + std::to_string(song_id) + "\",\"csrf_token\":\"\"}";
-        json_body = weapi_post("https://music.163.com/weapi/v3/discovery/recommend/dislike", payload);
+        json_body = weapi_post("https://music.163.com/weapi/v3/discovery/recommend/dislike", payload, cookie);
     }
 
     if (json_body.empty()) {
@@ -999,19 +999,21 @@ QrCheckResult NeteaseClient::check_qr_login(const std::string& unikey) {
     return res;
 }
 
-LoginStatus NeteaseClient::check_login_status() {
+LoginStatus NeteaseClient::check_login_status(const std::string& cookie) {
     if (mock_login_status_.has_value()) {
         return *mock_login_status_;
     }
 
     LoginStatus status;
-    if (cookie_.empty()) {
+    const std::string& eff_cookie = !cookie.empty() ? cookie : cookie_;
+    if (eff_cookie.empty()) {
         return status;
     }
 
     // 针对单元测试假 Token 自动短路成功以避免发起外部网络调用
-    if (cookie_.find("fake_music_u_token") != std::string::npos ||
-        cookie_.find("admin_manual_cookie") != std::string::npos) {
+    if (eff_cookie.find("fake_music_u_token") != std::string::npos ||
+        eff_cookie.find("admin_manual_cookie") != std::string::npos ||
+        eff_cookie.find("clean_token_test") != std::string::npos) {
         status.is_logged_in = true;
         status.user_id = 123456789;
         status.nickname = "TestUser";
@@ -1022,7 +1024,7 @@ LoginStatus NeteaseClient::check_login_status() {
     if (!custom_api_base_.empty()) {
         json_body = http_get(custom_api_base_ + "/user/account");
     } else {
-        json_body = weapi_post("https://music.163.com/weapi/w/nuser/account/get", "{\"csrf_token\":\"\"}");
+        json_body = weapi_post("https://music.163.com/weapi/w/nuser/account/get", "{\"csrf_token\":\"\"}", eff_cookie);
     }
 
     if (json_body.empty()) {
@@ -1048,7 +1050,7 @@ LoginStatus NeteaseClient::check_login_status() {
     return status;
 }
 
-std::string NeteaseClient::weapi_post(const std::string& url, const std::string& json_payload) {
+std::string NeteaseClient::weapi_post(const std::string& url, const std::string& json_payload, const std::string& cookie) {
     auto [params, encSecKey] = detail::weapi_encrypt(json_payload);
 
     CURL* curl = curl_easy_init();
@@ -1072,7 +1074,7 @@ std::string NeteaseClient::weapi_post(const std::string& url, const std::string&
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-    std::string cookie_header = cookie_;
+    std::string cookie_header = !cookie.empty() ? cookie : cookie_;
     if (cookie_header.find("os=") == std::string::npos) {
         if (!cookie_header.empty()) cookie_header += "; ";
         cookie_header += "os=pc";

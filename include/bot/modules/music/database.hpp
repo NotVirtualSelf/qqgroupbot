@@ -79,6 +79,48 @@ struct DailyPushedRecord {
 };
 
 /**
+ * @struct NeteasePlatformConfig
+ * @brief 网易云音乐平台相关常量与业务规则配置 (严禁硬编码)
+ */
+struct NeteasePlatformConfig {
+    static constexpr int MAX_RECOMMEND_SLOTS = 35; // 每日推荐歌曲数量上限（35首，对应单账号最多绑定的群聊数量）
+    static constexpr int RESET_HOUR = 6;           // 每日推荐刷新基准时刻 06:00
+    static constexpr int RESET_MINUTE = 0;
+    static constexpr int DEFAULT_PUSH_HOUR = 9;    // 默认推送时间 09:00
+    static constexpr int DEFAULT_PUSH_MINUTE = 0;
+    static constexpr int DEFAULT_EVAL_HOUR = 23;   // 默认结算时间 23:40
+    static constexpr int DEFAULT_EVAL_MINUTE = 40;
+};
+
+/**
+ * @struct GroupNeteaseAccount
+ * @brief 群绑定的网易云音乐账号实体 (支持自持账号与跨群共享账号)
+ */
+struct GroupNeteaseAccount {
+    int64_t group_id{0};             ///< 当前绑定的群号
+    int64_t source_group_id{0};      ///< 账号归属的源群号 (自持账号时等于 group_id)
+    std::string cookie;              ///< 网易云 Cookie (MUSIC_U 凭据)
+    std::string nickname;            ///< 账号昵称
+    int64_t account_uid{0};          ///< 账号 UID
+    bool is_vip{false};              ///< 是否为 VIP 会员
+    int recommend_slot{0};           ///< 日推分配槽位 (0..34)
+    int64_t updated_at{0};           ///< 最后更新时间戳 (秒)
+};
+
+/**
+ * @struct DailyMusicTimeConfig
+ * @brief 每日音乐推荐与结算时间配置
+ */
+struct DailyMusicTimeConfig {
+    int push_hour{NeteasePlatformConfig::DEFAULT_PUSH_HOUR};     ///< 默认推送小时 (0~23)
+    int push_minute{NeteasePlatformConfig::DEFAULT_PUSH_MINUTE};   ///< 默认推送分钟 (0~59)
+    int eval_hour{NeteasePlatformConfig::DEFAULT_EVAL_HOUR};    ///< 默认结算小时 (0~23)
+    int eval_minute{NeteasePlatformConfig::DEFAULT_EVAL_MINUTE};  ///< 默认结算分钟 (0~59)
+    int update_hour{NeteasePlatformConfig::RESET_HOUR};   ///< 日推更新时间点/周期分界线小时 (0~23，默认 6:00)
+    int update_minute{NeteasePlatformConfig::RESET_MINUTE}; ///< 日推更新时间点/周期分界线分钟 (0~59，默认 0)
+};
+
+/**
  * @class MusicDatabase
  * @brief SQLite 数据存储管理类 (RAII 资源管控 + 线程安全)
  */
@@ -407,6 +449,36 @@ public:
     bool reset_daily_push_status(int64_t group_id, const std::string& date = "");
 
     /**
+     * @brief 获取日推的时间配置 (推送时间、结算时间、更新周期分界线时间)
+     * @return DailyMusicTimeConfig
+     */
+    DailyMusicTimeConfig get_daily_music_time_config();
+
+    /**
+     * @brief 设置默认推送时间 (HH:MM)
+     * @param hour 小时 (0~23)
+     * @param minute 分钟 (0~59)
+     * @return bool 是否设置成功
+     */
+    bool set_daily_push_time(int hour, int minute);
+
+    /**
+     * @brief 设置默认结算时间 (HH:MM)
+     * @param hour 小时 (0~23)
+     * @param minute 分钟 (0~59)
+     * @return bool 是否设置成功
+     */
+    bool set_daily_eval_time(int hour, int minute);
+
+    /**
+     * @brief 设置日推更新时间点/周期分界线 (HH:MM)
+     * @param hour 小时 (0~23)
+     * @param minute 分钟 (0~59)
+     * @return bool 是否设置成功
+     */
+    bool set_daily_update_time(int hour, int minute);
+
+    /**
      * @brief 获取某条每日推荐消息的点赞与踩统计数
      * @param message_id 目标消息 ID
      * @return std::pair<int, int> {upvotes, downvotes}
@@ -459,10 +531,77 @@ public:
      */
     static const std::vector<int64_t>& get_hardcoded_admins();
 
+    /**
+     * @brief 分配账号的日推槽位 (采用线性探测法寻找 [0, max_slots-1] 中的最小空闲槽位)
+     * @param account_uid 账号 UID
+     * @param group_id 当前申请槽位的群号 (若为重新绑定则排除自己已有槽位)
+     * @param max_slots 槽位上限，默认为 NeteasePlatformConfig::MAX_RECOMMEND_SLOTS
+     * @return int 成功返回分配的槽位索引 (0-indexed)，若达到上限则返回 -1
+     */
+    int allocate_account_slot(int64_t account_uid, int64_t group_id, int max_slots = NeteasePlatformConfig::MAX_RECOMMEND_SLOTS);
+
+    /**
+     * @brief 为指定群设置/登录自持网易云音乐账号 (source_group_id 等于 group_id)
+     * @param group_id 目标群号
+     * @param cookie 网易云 Cookie (含 MUSIC_U)
+     * @param nickname 账号昵称
+     * @param account_uid 账号 UID
+     * @param is_vip 是否为 VIP
+     * @param recommend_slot 日推歌曲分配槽位 (0..34)
+     * @return bool 成功返回 true
+     */
+    bool set_group_netease_account(int64_t group_id, const std::string& cookie,
+                                  const std::string& nickname = "", int64_t account_uid = 0,
+                                  bool is_vip = false, int recommend_slot = 0);
+
+    /**
+     * @brief 将目标群 (dest_group) 关联共享源群 (src_group) 的网易云账号
+     * @param dest_group 被共享的目标群号
+     * @param src_group 提供账号的源群号
+     * @param recommend_slot 日推歌曲分配槽位 (0..34)
+     * @return bool 成功返回 true
+     */
+    bool share_group_netease_account(int64_t dest_group, int64_t src_group, int recommend_slot = 0);
+
+    /**
+     * @brief 查询某群绑定的网易云音乐账号 (若为共享账号则自动穿透查询源群账号信息)
+     * @param group_id 群号
+     * @return std::optional<GroupNeteaseAccount> 账号详情，未绑定则返回 nullopt
+     */
+    std::optional<GroupNeteaseAccount> get_group_netease_account(int64_t group_id);
+
+    /**
+     * @brief 清除指定群绑定的网易云账号记录 (退出登录或被覆盖时调用)
+     * @param group_id 群号
+     * @return bool 成功返回 true
+     */
+    bool clear_group_netease_account(int64_t group_id);
+
+    /**
+     * @brief 获取所有与指定群共享同一个网易云账号的群列表 (包含该群自身)
+     * @param group_id 群号
+     * @return std::vector<int64_t> 共享群号列表
+     */
+    std::vector<int64_t> get_groups_sharing_account(int64_t group_id);
+
+    /**
+     * @brief 获取指定群（包含所有共享同一个账号的群）当天的日推总点赞与踩统计数
+     * @param group_id 群号
+     * @param date 日期字符串 (YYYY-MM-DD，为空则默认为今天)
+     * @return std::pair<int, int> {total_upvotes, total_downvotes}
+     */
+    std::pair<int, int> get_shared_daily_push_votes(int64_t group_id, const std::string& date = "");
+
+    /**
+     * @brief 获取数据库中记录的所有群号列表 (订阅群、日推群、账号绑定群等)
+     * @return std::vector<int64_t> 群号列表
+     */
+    std::vector<int64_t> get_all_known_groups();
+
 private:
     std::string db_path_;
     sqlite3* db_{nullptr};
-    mutable std::mutex mutex_;
+    mutable std::recursive_mutex mutex_;
 };
 
 } // namespace bot::module::music

@@ -147,12 +147,12 @@ bool DailyMusicManager::trigger_push_now(const std::string& task_name, int64_t t
     return any_success;
 }
 
-bool DailyMusicManager::trigger_eval_now(const std::string& task_name) {
+bool DailyMusicManager::trigger_eval_now(const std::string& task_name, int64_t target_group) {
     std::lock_guard<std::mutex> lock(tasks_mutex_);
     bool any_success = false;
     for (const auto& recommender : recommenders_) {
         if (task_name.empty() || recommender->task_name() == task_name) {
-            bool ok = execute_eval(recommender);
+            bool ok = execute_eval(recommender, target_group);
             if (ok) any_success = true;
         }
     }
@@ -199,7 +199,8 @@ void DailyMusicManager::handle_reaction(const bot::protocol::GroupReactionEvent&
 
 DailyEvalAction DailyMusicManager::evaluate_item_votes(const std::shared_ptr<IDailyRecommender>& recommender,
                                                       const DailyRecommendationItem& item,
-                                                      int upvotes, int downvotes) {
+                                                      int upvotes, int downvotes,
+                                                      const std::string& cookie) {
     DailyEvalAction action = DailyEvalAction::None;
     // 规则 1: 如果点赞数量大于踩的数量+3，则点赞这首歌
     // 规则 2: 如果踩的数量大于等于点赞数量，则减少推荐这首歌
@@ -214,7 +215,7 @@ DailyEvalAction DailyMusicManager::evaluate_item_votes(const std::shared_ptr<IDa
 
     std::string result_msg;
     if (recommender) {
-        recommender->execute_evaluation(item, action, result_msg);
+        recommender->execute_evaluation_with_cookie(item, action, result_msg, cookie);
     }
 
     std::cout << "[DailyMusicManager] Silent Evaluation: item [" << item.item_name
@@ -229,14 +230,6 @@ DailyEvalAction DailyMusicManager::evaluate_item_votes(const std::shared_ptr<IDa
 
 bool DailyMusicManager::execute_push(const std::shared_ptr<IDailyRecommender>& recommender, int64_t target_group) {
     if (!recommender) return false;
-
-    DailyRecommendationItem item;
-    std::string err_msg;
-    if (!recommender->fetch_recommendation(item, err_msg)) {
-        std::cerr << "[DailyMusicManager] Failed to fetch recommendation for ["
-                  << recommender->task_name() << "]: " << err_msg << std::endl;
-        return false;
-    }
 
     std::vector<int64_t> groups;
     if (target_group != 0) {
@@ -262,17 +255,46 @@ bool DailyMusicManager::execute_push(const std::shared_ptr<IDailyRecommender>& r
     }
 
     std::string today_str = get_current_date_str();
-    auto msgs = recommender->build_push_messages(item);
+    // 缓存每个账号拉取的日推歌曲列表 (key: account_uid 或 source_gid)
+    std::unordered_map<int64_t, std::vector<DailyRecommendationItem>> cached_song_lists;
+    bool any_success = false;
 
     for (int64_t gid : groups) {
-        if (msgs.empty()) continue;
-
         // 核心逻辑：如果在每天默认推送日推时间之前已经手动触发过日推，那么不再发送默认日推
         if (target_group == 0 && db_.get_today_daily_push(gid, today_str).has_value()) {
             std::cout << "[DailyMusicManager] Group " << gid
                       << " already pushed daily music today before default push. Skipping default push." << std::endl;
             continue;
         }
+
+        // 查询该群绑定的账号 (自持或共享) 与分配的日推槽位
+        auto acc_opt = db_.get_group_netease_account(gid);
+        int64_t acc_uid = acc_opt.has_value() ? acc_opt->account_uid : 0;
+        int slot = acc_opt.has_value() ? acc_opt->recommend_slot : 0;
+        std::string cookie = acc_opt.has_value() ? acc_opt->cookie : "";
+
+        if (cached_song_lists.find(acc_uid) == cached_song_lists.end()) {
+            std::vector<DailyRecommendationItem> items;
+            std::string err_msg;
+            if (!recommender->fetch_recommendations_list_with_cookie(items, err_msg, cookie) || items.empty()) {
+                std::cerr << "[DailyMusicManager] Failed to fetch recommendations for group "
+                          << gid << " (UID " << acc_uid << "): " << err_msg << std::endl;
+                continue;
+            }
+            cached_song_lists[acc_uid] = std::move(items);
+        }
+
+        const auto& songs = cached_song_lists[acc_uid];
+        if (songs.empty()) continue;
+
+        // 根据群分配的槽位固定映射到日推中的对应歌曲
+        if (slot < 0) slot = 0;
+        const auto& item = songs[slot % songs.size()];
+
+        auto msgs = recommender->build_push_messages(item);
+        if (msgs.empty()) continue;
+
+        any_success = true;
 
         // 1. 发送音乐卡片 (记录首条信息入库，用于后续引用回复与表情回应统计)
         rpc_client_.send_group_msg(gid, msgs[0], [this, task_name = recommender->task_name(), gid, item, today_str](const bot::protocol::SendGroupMsgResult& res) {
@@ -288,16 +310,16 @@ bool DailyMusicManager::execute_push(const std::shared_ptr<IDailyRecommender>& r
             }
         });
 
-        // 2. 发送评价引导提示消息 (如：当日音乐日推为「歌曲名」- 艺术家名...)
+        // 2. 发送评价引导提示消息 (如：今日音乐推荐为\n「歌曲名」- 艺术家名...)
         for (size_t m = 1; m < msgs.size(); ++m) {
             rpc_client_.send_group_msg(gid, msgs[m]);
         }
     }
 
-    return true;
+    return any_success;
 }
 
-bool DailyMusicManager::execute_eval(const std::shared_ptr<IDailyRecommender>& recommender) {
+bool DailyMusicManager::execute_eval(const std::shared_ptr<IDailyRecommender>& recommender, int64_t target_group) {
     if (!recommender) return false;
 
     auto unevaluated = db_.get_unevaluated_daily_pushes(recommender->task_name());
@@ -307,42 +329,26 @@ bool DailyMusicManager::execute_eval(const std::shared_ptr<IDailyRecommender>& r
         return true;
     }
 
-    // 按 item_id 进行聚合，不同群中推的同一首歌合并投票数
-    struct AggItem {
-        DailyRecommendationItem item;
-        std::vector<int64_t> record_ids;
-        std::vector<int64_t> message_ids;
-        std::vector<std::pair<int64_t, std::string>> group_dates;
-        int total_upvotes{0};
-        int total_downvotes{0};
-    };
-
-    std::unordered_map<int64_t, AggItem> item_map;
+    // 评价数据不互通：各群独立展示本群评价数据，独立结算
     for (const auto& rec : unevaluated) {
-        auto [up, down] = db_.get_daily_push_votes(rec.message_id);
-        auto& agg = item_map[rec.item_id];
-        agg.item.item_id = rec.item_id;
-        agg.item.item_name = rec.item_name;
-        agg.item.artist_name = rec.artist_name;
-        agg.item.platform = rec.platform;
-        agg.record_ids.push_back(rec.id);
-        agg.message_ids.push_back(rec.message_id);
-        agg.group_dates.emplace_back(rec.group_id, rec.pushed_date);
-        agg.total_upvotes += up;
-        agg.total_downvotes += down;
-    }
+        if (target_group != 0 && rec.group_id != target_group) {
+            continue;
+        }
 
-    for (const auto& [item_id, agg] : item_map) {
-        evaluate_item_votes(recommender, agg.item, agg.total_upvotes, agg.total_downvotes);
-        for (int64_t rec_id : agg.record_ids) {
-            db_.mark_daily_push_evaluated(rec_id, agg.total_upvotes, agg.total_downvotes);
-        }
-        for (int64_t mid : agg.message_ids) {
-            db_.clear_daily_reactions(mid);
-        }
-        for (const auto& [gid, pdate] : agg.group_dates) {
-            db_.set_daily_evaluated(gid, pdate);
-        }
+        auto acc_opt = db_.get_group_netease_account(rec.group_id);
+        std::string cookie = acc_opt.has_value() ? acc_opt->cookie : "";
+
+        auto [up, down] = db_.get_daily_push_votes(rec.message_id);
+        DailyRecommendationItem item;
+        item.item_id = rec.item_id;
+        item.item_name = rec.item_name;
+        item.artist_name = rec.artist_name;
+        item.platform = rec.platform;
+
+        evaluate_item_votes(recommender, item, up, down, cookie);
+        db_.mark_daily_push_evaluated(rec.id, up, down);
+        db_.clear_daily_reactions(rec.message_id);
+        db_.set_daily_evaluated(rec.group_id, rec.pushed_date);
     }
 
     return true;
@@ -372,7 +378,18 @@ std::chrono::seconds DailyMusicManager::calculate_delay_until(int target_hour, i
     return std::chrono::seconds(target_c - now_c);
 }
 
-std::string DailyMusicManager::get_current_date_str() {
+namespace {
+std::optional<std::pair<int, int>> g_mock_current_hm;
+} // namespace
+
+void DailyMusicManager::set_mock_time(std::optional<std::pair<int, int>> mock_hm) {
+    g_mock_current_hm = mock_hm;
+}
+
+std::pair<int, int> DailyMusicManager::get_current_time_hm() {
+    if (g_mock_current_hm.has_value()) {
+        return *g_mock_current_hm;
+    }
     auto now = std::chrono::system_clock::now();
     std::time_t now_c = std::chrono::system_clock::to_time_t(now);
     std::tm local_tm{};
@@ -381,6 +398,48 @@ std::string DailyMusicManager::get_current_date_str() {
 #else
     localtime_r(&now_c, &local_tm);
 #endif
+    return {local_tm.tm_hour, local_tm.tm_min};
+}
+
+void DailyMusicManager::update_schedule_times(int push_h, int push_m, int eval_h, int eval_m) {
+    std::lock_guard<std::mutex> lock(tasks_mutex_);
+    for (auto& ctx : task_contexts_) {
+        if (!ctx || !ctx->recommender) continue;
+        auto netease_rec = std::dynamic_pointer_cast<NeteaseDailySongRecommender>(ctx->recommender);
+        if (netease_rec) {
+            netease_rec->set_push_time(push_h, push_m);
+            netease_rec->set_eval_time(eval_h, eval_m);
+        }
+        if (is_running_) {
+            if (ctx->push_timer) {
+                ctx->push_timer->cancel();
+                schedule_push_for_task(*ctx);
+            }
+            if (ctx->eval_timer) {
+                ctx->eval_timer->cancel();
+                schedule_eval_for_task(*ctx);
+            }
+        }
+    }
+}
+
+std::string DailyMusicManager::get_current_date_str(int update_hour, int update_minute) {
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+    std::tm local_tm{};
+#if defined(_WIN32)
+    localtime_s(&local_tm, &now_c);
+#else
+    localtime_r(&now_c, &local_tm);
+#endif
+
+    auto [cur_h, cur_m] = get_current_time_hm();
+    // 如果当前时间位于 00:00 ~ 更新时间 (如 06:00) 之间，则属于上一日日推周期
+    if ((cur_h * 60 + cur_m) < (update_hour * 60 + update_minute)) {
+        local_tm.tm_mday -= 1;
+        std::mktime(&local_tm);
+    }
+
     std::ostringstream oss;
     oss << std::put_time(&local_tm, "%Y-%m-%d");
     return oss.str();
