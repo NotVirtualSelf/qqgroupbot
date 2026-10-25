@@ -1,0 +1,10 @@
+build/
+CMakeUserPresets.json
+.cache/
+.vscode/
+.idea/
+napcat/
+data/*.db
+data/*.db-journal
+*.db
+*.db-journal

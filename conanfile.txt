@@ -1,0 +1,15 @@
+[requires]
+boost/1.86.0
+openssl/3.3.2
+glaze/8.4.0
+sqlite3/3.47.2
+
+[options]
+boost/*:header_only=True
+
+[generators]
+CMakeDeps
+CMakeToolchain
+
+[layout]
+cmake_layout

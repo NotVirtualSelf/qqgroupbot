@@ -1,0 +1,19 @@
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: always
+    ports:
+      - "6099:6099"      # NapCat WebUI 控制台 (网页扫码登录、管理配置)
+    environment:
+      - ACCOUNT=3809397604
+      - TZ=Asia/Shanghai
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
+      - 8.8.8.8
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # 允许容器内的 NapCat 连接宿主机上的 C++ WebSocket 服务端
+    volumes:
+      - ./napcat/config:/app/napcat/config
+      - ./napcat/qq:/app/.config/QQ
