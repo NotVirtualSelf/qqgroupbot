@@ -95,7 +95,8 @@ bool MusicDatabase::init() {
             timestamp INTEGER NOT NULL,
             evaluated INTEGER NOT NULL DEFAULT 0,
             upvotes INTEGER NOT NULL DEFAULT 0,
-            downvotes INTEGER NOT NULL DEFAULT 0
+            downvotes INTEGER NOT NULL DEFAULT 0,
+            card_message_id INTEGER DEFAULT 0
         );
 
         CREATE INDEX IF NOT EXISTS idx_daily_pushed_msg ON daily_pushed_records(message_id);
@@ -105,9 +106,10 @@ bool MusicDatabase::init() {
         CREATE TABLE IF NOT EXISTS daily_reaction_records (
             message_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
+            emoji_id TEXT NOT NULL DEFAULT '',
             reaction_type INTEGER NOT NULL,
             created_at INTEGER NOT NULL,
-            PRIMARY KEY (message_id, user_id)
+            PRIMARY KEY (message_id, user_id, emoji_id)
         );
 
         CREATE INDEX IF NOT EXISTS idx_daily_reactions_msg ON daily_reaction_records(message_id);
@@ -145,6 +147,10 @@ bool MusicDatabase::init() {
 
     // 增量迁移：为 group_netease_accounts 添加 recommend_slot 字段
     sqlite3_exec(db_, "ALTER TABLE group_netease_accounts ADD COLUMN recommend_slot INTEGER DEFAULT 0;", nullptr, nullptr, nullptr);
+    // 增量迁移：为 daily_pushed_records 添加 card_message_id 字段
+    sqlite3_exec(db_, "ALTER TABLE daily_pushed_records ADD COLUMN card_message_id INTEGER DEFAULT 0;", nullptr, nullptr, nullptr);
+    // 增量索引：在 card_message_id 字段确认存在后创建索引
+    sqlite3_exec(db_, "CREATE INDEX IF NOT EXISTS idx_daily_pushed_card_msg ON daily_pushed_records(card_message_id);", nullptr, nullptr, nullptr);
 
     // 针对现在已经登录的网易云账号，把它变成 1022206916 这个群的网易云音乐账号
     {
@@ -286,6 +292,56 @@ bool MusicDatabase::init() {
             COMMIT;
         )";
         sqlite3_exec(db_, migration, nullptr, nullptr, nullptr);
+    }
+
+    // 检查 daily_reaction_records 主键是否包含 emoji_id，若未包含则迁移至联合主键 (message_id, user_id, emoji_id)
+    {
+        bool has_emoji_col = false;
+        bool emoji_in_pk = false;
+        sqlite3_stmt* check_stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, "PRAGMA table_info(daily_reaction_records);", -1, &check_stmt, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(check_stmt) == SQLITE_ROW) {
+                int is_pk = sqlite3_column_int(check_stmt, 5);
+                const char* col_name = reinterpret_cast<const char*>(sqlite3_column_text(check_stmt, 1));
+                if (col_name && std::string(col_name) == "emoji_id") {
+                    has_emoji_col = true;
+                    if (is_pk > 0) {
+                        emoji_in_pk = true;
+                    }
+                }
+            }
+            sqlite3_finalize(check_stmt);
+        }
+
+        if (!emoji_in_pk) {
+            std::string select_cols = has_emoji_col 
+                ? "message_id, user_id, COALESCE(emoji_id, ''), reaction_type, created_at"
+                : "message_id, user_id, '', reaction_type, created_at";
+            std::string migration = "BEGIN TRANSACTION;\n"
+                "CREATE TABLE IF NOT EXISTS daily_reaction_records_new (\n"
+                "    message_id INTEGER NOT NULL,\n"
+                "    user_id INTEGER NOT NULL,\n"
+                "    emoji_id TEXT NOT NULL DEFAULT '',\n"
+                "    reaction_type INTEGER NOT NULL,\n"
+                "    created_at INTEGER NOT NULL,\n"
+                "    PRIMARY KEY (message_id, user_id, emoji_id)\n"
+                ");\n"
+                "INSERT OR IGNORE INTO daily_reaction_records_new (message_id, user_id, emoji_id, reaction_type, created_at)\n"
+                "SELECT " + select_cols + " FROM daily_reaction_records;\n"
+                "DROP TABLE daily_reaction_records;\n"
+                "ALTER TABLE daily_reaction_records_new RENAME TO daily_reaction_records;\n"
+                "CREATE INDEX IF NOT EXISTS idx_daily_reactions_msg ON daily_reaction_records(message_id);\n"
+                "COMMIT;\n";
+            char* mig_err = nullptr;
+            if (sqlite3_exec(db_, migration.c_str(), nullptr, nullptr, &mig_err) != SQLITE_OK) {
+                std::cerr << "[MusicDatabase] daily_reaction_records migration error: " 
+                          << (mig_err ? mig_err : "unknown") << std::endl;
+                sqlite3_free(mig_err);
+                sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+            } else {
+                std::cout << "[MusicDatabase] Migrated daily_reaction_records to include emoji_id in PRIMARY KEY." << std::endl;
+            }
+        }
     }
 
     std::cout << "[MusicDatabase] SQLite database initialized successfully at " << db_path_ << std::endl;
@@ -849,18 +905,20 @@ std::vector<int64_t> MusicDatabase::get_daily_music_groups() {
 }
 
 int64_t MusicDatabase::record_daily_push(const std::string& task_name, int64_t group_id, int64_t message_id,
-                                        int64_t item_id, const std::string& item_name, const std::string& artist_name,
-                                        const std::string& platform, const std::string& date, int64_t timestamp) {
+                                         int64_t item_id, const std::string& item_name, const std::string& artist_name,
+                                         const std::string& platform, const std::string& date, int64_t timestamp,
+                                         int64_t card_message_id) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return -1;
 
     const char* sql = R"(
         INSERT INTO daily_pushed_records
-        (task_name, group_id, message_id, item_id, item_name, artist_name, platform, pushed_date, timestamp, evaluated, upvotes, downvotes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0);
+        (task_name, group_id, message_id, item_id, item_name, artist_name, platform, pushed_date, timestamp, evaluated, upvotes, downvotes, card_message_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?);
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        std::cerr << "[MusicDatabase] record_daily_push prepare error: " << sqlite3_errmsg(db_) << std::endl;
         return -1;
     }
 
@@ -879,14 +937,53 @@ int64_t MusicDatabase::record_daily_push(const std::string& task_name, int64_t g
     sqlite3_bind_text(stmt, 7, platform.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 8, date.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_int64(stmt, 9, ts);
+    sqlite3_bind_int64(stmt, 10, card_message_id);
 
     int64_t row_id = -1;
-    if (sqlite3_step(stmt) == SQLITE_DONE) {
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_DONE) {
         row_id = sqlite3_last_insert_rowid(db_);
+    } else {
+        std::cerr << "[MusicDatabase] record_daily_push step error: " << sqlite3_errmsg(db_) << " (rc=" << rc << ")" << std::endl;
     }
 
     sqlite3_finalize(stmt);
     return row_id;
+}
+
+bool MusicDatabase::update_daily_push_card_message_id(int64_t group_id, const std::string& date, int64_t card_message_id) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!db_) return false;
+
+    std::string d = date;
+    if (d.empty()) {
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+        std::tm local_tm{};
+#if defined(_WIN32)
+        localtime_s(&local_tm, &now_c);
+#else
+        localtime_r(&now_c, &local_tm);
+#endif
+        std::ostringstream oss;
+        oss << std::put_time(&local_tm, "%Y-%m-%d");
+        d = oss.str();
+    }
+
+    const char* sql = "UPDATE daily_pushed_records SET card_message_id = ? WHERE group_id = ? AND pushed_date = ?;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        std::cerr << "[MusicDatabase] update_daily_push_card_message_id prepare error: " << sqlite3_errmsg(db_) << std::endl;
+        return false;
+    }
+
+    sqlite3_bind_int64(stmt, 1, card_message_id);
+    sqlite3_bind_int64(stmt, 2, group_id);
+    sqlite3_bind_text(stmt, 3, d.c_str(), -1, SQLITE_STATIC);
+
+    bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
 }
 
 namespace {
@@ -910,6 +1007,9 @@ DailyPushedRecord parse_daily_pushed_row(sqlite3_stmt* stmt) {
     rec.evaluated = sqlite3_column_int(stmt, 10);
     rec.upvotes = sqlite3_column_int(stmt, 11);
     rec.downvotes = sqlite3_column_int(stmt, 12);
+    if (sqlite3_column_count(stmt) > 13) {
+        rec.card_message_id = sqlite3_column_int64(stmt, 13);
+    }
     return rec;
 }
 } // namespace
@@ -919,8 +1019,8 @@ std::optional<DailyPushedRecord> MusicDatabase::get_daily_push_by_message_id(int
     if (!db_) return std::nullopt;
 
     const char* sql = R"(
-        SELECT id, task_name, group_id, message_id, item_id, item_name, artist_name, platform, pushed_date, timestamp, evaluated, upvotes, downvotes
-        FROM daily_pushed_records WHERE message_id = ? LIMIT 1;
+        SELECT id, task_name, group_id, message_id, item_id, item_name, artist_name, platform, pushed_date, timestamp, evaluated, upvotes, downvotes, card_message_id
+        FROM daily_pushed_records WHERE message_id = ? OR card_message_id = ? ORDER BY id DESC LIMIT 1;
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -928,6 +1028,7 @@ std::optional<DailyPushedRecord> MusicDatabase::get_daily_push_by_message_id(int
     }
 
     sqlite3_bind_int64(stmt, 1, message_id);
+    sqlite3_bind_int64(stmt, 2, message_id);
 
     std::optional<DailyPushedRecord> result;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -945,7 +1046,7 @@ std::optional<DailyPushedRecord> MusicDatabase::get_latest_daily_push(int64_t gr
     sqlite3_stmt* stmt = nullptr;
     if (task_name.empty()) {
         const char* sql = R"(
-            SELECT id, task_name, group_id, message_id, item_id, item_name, artist_name, platform, pushed_date, timestamp, evaluated, upvotes, downvotes
+            SELECT id, task_name, group_id, message_id, item_id, item_name, artist_name, platform, pushed_date, timestamp, evaluated, upvotes, downvotes, card_message_id
             FROM daily_pushed_records WHERE group_id = ? ORDER BY timestamp DESC, id DESC LIMIT 1;
         )";
         if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -954,7 +1055,7 @@ std::optional<DailyPushedRecord> MusicDatabase::get_latest_daily_push(int64_t gr
         sqlite3_bind_int64(stmt, 1, group_id);
     } else {
         const char* sql = R"(
-            SELECT id, task_name, group_id, message_id, item_id, item_name, artist_name, platform, pushed_date, timestamp, evaluated, upvotes, downvotes
+            SELECT id, task_name, group_id, message_id, item_id, item_name, artist_name, platform, pushed_date, timestamp, evaluated, upvotes, downvotes, card_message_id
             FROM daily_pushed_records WHERE group_id = ? AND task_name = ? ORDER BY timestamp DESC, id DESC LIMIT 1;
         )";
         if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -993,7 +1094,7 @@ std::optional<DailyPushedRecord> MusicDatabase::get_today_daily_push(int64_t gro
     }
 
     const char* sql = R"(
-        SELECT id, task_name, group_id, message_id, item_id, item_name, artist_name, platform, pushed_date, timestamp, evaluated, upvotes, downvotes
+        SELECT id, task_name, group_id, message_id, item_id, item_name, artist_name, platform, pushed_date, timestamp, evaluated, upvotes, downvotes, card_message_id
         FROM daily_pushed_records WHERE group_id = ? AND pushed_date = ? ORDER BY id ASC LIMIT 1;
     )";
     sqlite3_stmt* stmt = nullptr;
@@ -1021,7 +1122,7 @@ std::vector<DailyPushedRecord> MusicDatabase::get_unevaluated_daily_pushes(const
     sqlite3_stmt* stmt = nullptr;
     if (task_name.empty()) {
         const char* sql = R"(
-            SELECT id, task_name, group_id, message_id, item_id, item_name, artist_name, platform, pushed_date, timestamp, evaluated, upvotes, downvotes
+            SELECT id, task_name, group_id, message_id, item_id, item_name, artist_name, platform, pushed_date, timestamp, evaluated, upvotes, downvotes, card_message_id
             FROM daily_pushed_records WHERE evaluated = 0 ORDER BY timestamp ASC;
         )";
         if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -1029,7 +1130,7 @@ std::vector<DailyPushedRecord> MusicDatabase::get_unevaluated_daily_pushes(const
         }
     } else {
         const char* sql = R"(
-            SELECT id, task_name, group_id, message_id, item_id, item_name, artist_name, platform, pushed_date, timestamp, evaluated, upvotes, downvotes
+            SELECT id, task_name, group_id, message_id, item_id, item_name, artist_name, platform, pushed_date, timestamp, evaluated, upvotes, downvotes, card_message_id
             FROM daily_pushed_records WHERE evaluated = 0 AND task_name = ? ORDER BY timestamp ASC;
         )";
         if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -1065,11 +1166,11 @@ bool MusicDatabase::mark_daily_push_evaluated(int64_t record_id, int upvotes, in
     return ok;
 }
 
-bool MusicDatabase::record_daily_reaction(int64_t message_id, int64_t user_id, int reaction_type) {
+bool MusicDatabase::record_daily_reaction(int64_t message_id, int64_t user_id, const std::string& emoji_id, int reaction_type) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
-    const char* sql = "INSERT OR REPLACE INTO daily_reaction_records (message_id, user_id, reaction_type, created_at) VALUES (?, ?, ?, ?);";
+    const char* sql = "INSERT OR REPLACE INTO daily_reaction_records (message_id, user_id, emoji_id, reaction_type, created_at) VALUES (?, ?, ?, ?, ?);";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         return false;
@@ -1080,29 +1181,55 @@ bool MusicDatabase::record_daily_reaction(int64_t message_id, int64_t user_id, i
 
     sqlite3_bind_int64(stmt, 1, message_id);
     sqlite3_bind_int64(stmt, 2, user_id);
-    sqlite3_bind_int(stmt, 3, reaction_type);
-    sqlite3_bind_int64(stmt, 4, now);
+    sqlite3_bind_text(stmt, 3, emoji_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, reaction_type);
+    sqlite3_bind_int64(stmt, 5, now);
 
     bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
     return ok;
 }
 
-bool MusicDatabase::remove_daily_reaction(int64_t message_id, int64_t user_id) {
+bool MusicDatabase::record_daily_reaction(int64_t message_id, int64_t user_id, int reaction_type) {
+    return record_daily_reaction(message_id, user_id, "", reaction_type);
+}
+
+bool MusicDatabase::remove_daily_reaction(int64_t message_id, int64_t user_id, const std::string& emoji_id) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!db_) return false;
 
-    const char* sql = "DELETE FROM daily_reaction_records WHERE message_id = ? AND user_id = ?;";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        return false;
+    if (emoji_id.empty()) {
+        const char* sql = "DELETE FROM daily_reaction_records WHERE message_id = ? AND user_id = ?;";
+        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            return false;
+        }
+        sqlite3_bind_int64(stmt, 1, message_id);
+        sqlite3_bind_int64(stmt, 2, user_id);
+    } else {
+        const char* sql = "DELETE FROM daily_reaction_records WHERE message_id = ? AND user_id = ? AND emoji_id = ?;";
+        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            return false;
+        }
+        sqlite3_bind_int64(stmt, 1, message_id);
+        sqlite3_bind_int64(stmt, 2, user_id);
+        sqlite3_bind_text(stmt, 3, emoji_id.c_str(), -1, SQLITE_TRANSIENT);
     }
-
-    sqlite3_bind_int64(stmt, 1, message_id);
-    sqlite3_bind_int64(stmt, 2, user_id);
 
     bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
+
+    if (ok && !emoji_id.empty() && sqlite3_changes(db_) == 0) {
+        // Fallback: 如果指定表情未删除成功，且存在空 emoji_id 的旧记录，尝试删除旧记录
+        const char* fallback_sql = "DELETE FROM daily_reaction_records WHERE message_id = ? AND user_id = ? AND emoji_id = '';";
+        if (sqlite3_prepare_v2(db_, fallback_sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_int64(stmt, 1, message_id);
+            sqlite3_bind_int64(stmt, 2, user_id);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+    }
+
     return ok;
 }
 
@@ -1258,14 +1385,17 @@ bool MusicDatabase::reset_daily_push_status(int64_t group_id, const std::string&
     {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
         if (db_) {
-            const char* sql = "SELECT message_id FROM daily_pushed_records WHERE group_id = ? AND pushed_date = ?;";
+            const char* sql = "SELECT message_id, card_message_id FROM daily_pushed_records WHERE group_id = ? AND pushed_date = ?;";
             sqlite3_stmt* stmt = nullptr;
             if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
                 sqlite3_bind_int64(stmt, 1, group_id);
                 sqlite3_bind_text(stmt, 2, d.c_str(), -1, SQLITE_STATIC);
                 std::vector<int64_t> msg_ids;
                 while (sqlite3_step(stmt) == SQLITE_ROW) {
-                    msg_ids.push_back(sqlite3_column_int64(stmt, 0));
+                    int64_t m1 = sqlite3_column_int64(stmt, 0);
+                    int64_t m2 = sqlite3_column_int64(stmt, 1);
+                    if (m1 > 0) msg_ids.push_back(m1);
+                    if (m2 > 0) msg_ids.push_back(m2);
                 }
                 sqlite3_finalize(stmt);
 
@@ -1353,15 +1483,19 @@ std::pair<int, int> MusicDatabase::get_daily_push_votes(int64_t message_id) {
     if (!db_) return {0, 0};
 
     // 若该条消息已结算，直接从 daily_pushed_records 获取保存的结算投票数据
-    const char* sql_rec = "SELECT evaluated, upvotes, downvotes FROM daily_pushed_records WHERE message_id = ? LIMIT 1;";
+    const char* sql_rec = "SELECT evaluated, upvotes, downvotes, message_id FROM daily_pushed_records WHERE message_id = ? OR card_message_id = ? LIMIT 1;";
     sqlite3_stmt* stmt_rec = nullptr;
+    int64_t target_mid = message_id;
     if (sqlite3_prepare_v2(db_, sql_rec, -1, &stmt_rec, nullptr) == SQLITE_OK) {
         sqlite3_bind_int64(stmt_rec, 1, message_id);
+        sqlite3_bind_int64(stmt_rec, 2, message_id);
         if (sqlite3_step(stmt_rec) == SQLITE_ROW) {
             int eval = sqlite3_column_int(stmt_rec, 0);
+            int up = sqlite3_column_int(stmt_rec, 1);
+            int down = sqlite3_column_int(stmt_rec, 2);
+            int64_t actual_mid = sqlite3_column_int64(stmt_rec, 3);
+            if (actual_mid > 0) target_mid = actual_mid;
             if (eval == 1) {
-                int up = sqlite3_column_int(stmt_rec, 1);
-                int down = sqlite3_column_int(stmt_rec, 2);
                 sqlite3_finalize(stmt_rec);
                 return {up, down};
             }
@@ -1381,7 +1515,7 @@ std::pair<int, int> MusicDatabase::get_daily_push_votes(int64_t message_id) {
         return {0, 0};
     }
 
-    sqlite3_bind_int64(stmt, 1, message_id);
+    sqlite3_bind_int64(stmt, 1, target_mid);
 
     int up = 0;
     int down = 0;

@@ -114,7 +114,8 @@ public:
      * @return int64_t 数据库自增记录 ID
      */
     int64_t record_push(const std::string& task_name, int64_t group_id, int64_t message_id,
-                        const DailyRecommendationItem& item, const std::string& date = "");
+                        const DailyRecommendationItem& item, const std::string& date = "",
+                        int64_t card_message_id = 0);
 
     /**
      * @brief 根据点赞与踩的票数对比决定评价动作并执行反馈
@@ -184,6 +185,9 @@ private:
     mutable std::mutex tasks_mutex_;
     std::vector<std::shared_ptr<IDailyRecommender>> recommenders_;
     std::vector<std::unique_ptr<RecommenderTaskContext>> task_contexts_;
+
+    mutable std::mutex msg_id_map_mutex_;
+    std::unordered_map<int64_t, int64_t> secondary_to_primary_msg_id_;
 };
 
 } // namespace bot::module::music

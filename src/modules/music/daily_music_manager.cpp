@@ -9,6 +9,7 @@
 #include <iostream>
 #include <ctime>
 #include <set>
+#include <unordered_set>
 #include <chrono>
 #include <sstream>
 #include <iomanip>
@@ -160,40 +161,132 @@ bool DailyMusicManager::trigger_eval_now(const std::string& task_name, int64_t t
 }
 
 int64_t DailyMusicManager::record_push(const std::string& task_name, int64_t group_id, int64_t message_id,
-                                      const DailyRecommendationItem& item, const std::string& date) {
+                                       const DailyRecommendationItem& item, const std::string& date,
+                                       int64_t card_message_id) {
     std::string d = date.empty() ? get_current_date_str() : date;
     return db_.record_daily_push(task_name, group_id, message_id,
                                  item.item_id, item.item_name, item.artist_name,
-                                 item.platform, d);
+                                 item.platform, d, 0, card_message_id);
 }
 
 void DailyMusicManager::handle_reaction(const bot::protocol::GroupReactionEvent& event) {
-    // 检查此 message_id 是否属于某条每日推送消息
-    auto push_opt = db_.get_daily_push_by_message_id(event.message_id);
-    if (!push_opt.has_value()) {
-        return; // 不是每日推荐的消息回应，忽略
-    }
+    int64_t target_msg_id = event.message_id;
 
-    // 检查表情类型
-    // "对的对的": 478 或 /对的对的 或 对的对的
-    // "不对不对": 479 或 /不对不对 或 不对不对
-    bool is_like = (event.emoji_id == "478" || event.emoji_id == "/对的对的" || event.emoji_id == "对的对的");
-    bool is_dislike = (event.emoji_id == "479" || event.emoji_id == "/不对不对" || event.emoji_id == "不对不对");
+    // 检查此 message_id 是否属于某条每日推送消息（严格限制：仅收集转发卡片本身，不允许有其他的）
+    auto push_opt = db_.get_daily_push_by_message_id(target_msg_id);
+    if (!push_opt.has_value() || push_opt->message_id != target_msg_id) {
+        return; // 不是每日推荐转发卡片的消息回应，严格忽略
+    }
+    target_msg_id = push_opt->message_id;
+
+    std::cout << "[DailyMusicManager] Received reaction event: msg_id=" << event.message_id
+              << " (target_msg_id=" << target_msg_id << "), user_id=" << event.user_id
+              << ", emoji_id=" << event.emoji_id << ", code=" << event.code
+              << ", is_add=" << event.is_add << std::endl;
+
+    // 代表「点赞 / 喜爱 / 认可」的表情集合：
+    // 包含各类手势夸赞、点赞、爱心、常用好评 Emoji 以及网络流行梗表情（🐛、🐋、🐍、🧊、✈️、/拜谢）
+    static const std::unordered_set<std::string> LIKE_EMOJIS = {
+        // --- 手势 / 点赞类 ---
+        "76", "/赞", "赞",
+        "201", "/点赞", "点赞",
+        "364", "/超级赞", "超级赞",
+        "389", "/太赞了", "太赞了",
+        "447",
+        "380", "/真棒", "真棒",
+        "346", "/你真棒棒", "你真棒棒",
+        "221", "/顶呱呱", "顶呱呱",
+        "299", "/牛啊", "牛啊",
+        "306", "/牛气冲天", "牛气冲天",
+        "356", "/666", "666",
+        "444", "/超级6", "超级6",
+        "478", "/对的对的", "对的对的", "10478",
+        "79", "/胜利", "胜利",
+        "124", "/OK", "OK",
+        "398", "/超级ok", "超级ok",
+        "498", "/中!", "中!", "/中", "中",
+        "449", "/+1", "+1",
+        "99", "/鼓掌", "鼓掌",
+        "375", "/超级鼓掌", "超级鼓掌",
+
+        // --- 喜爱 / 爱心类 ---
+        "66", "/爱心", "爱心",
+        "122", "/爱你", "爱你",
+        "42", "/爱情", "爱情",
+        "319", "/比心", "比心",
+        "445", "/比个心", "比个心",
+        "484", "/比爱心", "比爱心",
+        "318", "/崇拜", "崇拜",
+        "472", "/心动", "心动",
+        "473", "/爱意", "爱意",
+        "506", "/捡到宝了", "捡到宝了",
+
+        // --- 常见好评 Emoji 符号及编码 ---
+        "👍", "128077", "/厉害", "厉害",
+        "❤️", "\xe2\x9d\xa4", "\xe2\x9d\xa4\xef\xb8\x8f", "10084",
+        "👏", "128079",
+        "🎉", "127881", "320", "/庆祝", "庆祝",
+        "🔥", "128293", "/火", "火",
+        "👌", "128076",
+        "✌", "✌️", "9996",
+
+        // --- 网络流行梗额外好评表情 ---
+        "🐛", "128027", "/虫", "虫",
+        "🐋", "128011", "🐳", "128051", "400339", "/鲸鱼", "鲸鱼",
+        "🐍", "128013", "400335",
+        "🧊", "129482",
+        "✈️", "✈", "9992", "/飞机", "飞机",
+        "297", "10297", "/拜谢", "拜谢"
+    };
+
+    // 代表「踩 / 讨厌 / 差评」的表情集合：
+    // 根据需求仅精准选取：/不对不对、/续标识、❔、/棒棒糖
+    static const std::unordered_set<std::string> DISLIKE_EMOJIS = {
+        // --- 1. /不对不对 ---
+        "479", "/不对不对", "不对不对", "10479",
+
+        // --- 2. /续标识 ---
+        "424", "/续标识", "续标识", "10424",
+
+        // --- 3. ❔ (问号/质疑：涵盖 QQ NT 各种上报变体) ---
+        // QQ 官方表情配置 (QCid: 10068, EMCode: 401145, AQLid: 134)
+        "10068", "401145", "134",
+        // 白色问号 Unicode 字符及其 UTF-8 变体
+        "❔", "\xe2\x9d\x95",
+        // 红色问号 Unicode 及其编码
+        "❓", "\xe2\x9d\x93", "10067", "401144",
+        // 常见 ASCII / 全角问号字符及其十进制编码
+        "?", "？", "63", "65311",
+        // 经典小黄脸疑问与问号脸表情 (QQ face ID: 32 与 268)
+        "32", "132", "/疑问", "疑问",
+        "268", "10268", "/问号", "问号", "/问号脸", "问号脸",
+
+        // --- 4. /棒棒糖 ---
+        "147", "/棒棒糖", "棒棒糖", "400147", "127853", "🍭", "\xf0\x9f\x8d\xad"
+    };
+
+    bool is_like = LIKE_EMOJIS.contains(event.emoji_id) || (!event.code.empty() && LIKE_EMOJIS.contains(event.code));
+    bool is_dislike = DISLIKE_EMOJIS.contains(event.emoji_id) || (!event.code.empty() && DISLIKE_EMOJIS.contains(event.code));
 
     if (!is_like && !is_dislike) {
+        std::cout << "[DailyMusicManager] Reaction emoji_id=" << event.emoji_id
+                  << " (code=" << event.code << ") ignored (not in like/dislike sets)" << std::endl;
         return; // 用户添加了其他表情，不计入点赞/踩
     }
 
+    std::string emoji_key = !event.emoji_id.empty() ? event.emoji_id : event.code;
+
     if (event.is_add) {
         int vote = is_like ? 1 : -1;
-        db_.record_daily_reaction(event.message_id, event.user_id, vote);
+        db_.record_daily_reaction(target_msg_id, event.user_id, emoji_key, vote);
         std::cout << "[DailyMusicManager] User " << event.user_id << " reacted with "
-                  << (is_like ? "Like (对的对的)" : "Dislike (不对不对)")
-                  << " to daily music message " << event.message_id << std::endl;
+                  << (is_like ? "Like (" : "Dislike (") << emoji_key << ")"
+                  << " to daily music message " << target_msg_id << std::endl;
     } else {
-        db_.remove_daily_reaction(event.message_id, event.user_id);
-        std::cout << "[DailyMusicManager] User " << event.user_id << " unreacted from daily music message "
-                  << event.message_id << std::endl;
+        db_.remove_daily_reaction(target_msg_id, event.user_id, emoji_key);
+        std::cout << "[DailyMusicManager] User " << event.user_id << " unreacted ("
+                  << emoji_key << ") from daily music message "
+                  << target_msg_id << std::endl;
     }
 }
 
@@ -291,29 +384,51 @@ bool DailyMusicManager::execute_push(const std::shared_ptr<IDailyRecommender>& r
         if (slot < 0) slot = 0;
         const auto& item = songs[slot % songs.size()];
 
-        auto msgs = recommender->build_push_messages(item);
-        if (msgs.empty()) continue;
+        auto forward_nodes = recommender->build_push_forward_nodes(item, "每日推荐", rpc_client_.self_uin());
+        if (forward_nodes.empty()) continue;
 
         any_success = true;
 
-        // 1. 发送音乐卡片 (记录首条信息入库，用于后续引用回复与表情回应统计)
-        rpc_client_.send_group_msg(gid, msgs[0], [this, task_name = recommender->task_name(), gid, item, today_str](const bot::protocol::SendGroupMsgResult& res) {
-            if (res.success) {
-                std::cout << "[DailyMusicManager] Pushed daily music to group " << gid
-                          << ", message_id=" << res.message_id << std::endl;
-                db_.record_daily_push(task_name, gid, res.message_id,
+        rpc_client_.send_group_forward_msg(gid, forward_nodes, [this, task_name = recommender->task_name(), gid, item, today_str, forward_nodes](const bot::protocol::SendGroupMsgResult& res) {
+            int64_t forward_msg_id = res.success ? res.message_id : 0;
+            if (forward_msg_id > 0) {
+                std::cout << "[DailyMusicManager] Pushed daily music forward card to group " << gid
+                          << ", message_id=" << forward_msg_id << std::endl;
+                db_.record_daily_push(task_name, gid, forward_msg_id,
                                       item.item_id, item.item_name, item.artist_name,
-                                      item.platform, today_str);
+                                      item.platform, today_str, 0, forward_msg_id);
             } else {
-                std::cerr << "[DailyMusicManager] Failed to push to group " << gid
-                          << ": " << res.error_message << std::endl;
+                std::cerr << "[DailyMusicManager] Failed to send forward card to group " << gid
+                          << ": " << res.error_message << ", retrying without images..." << std::endl;
+                auto no_img_nodes = forward_nodes;
+                for (auto& node : no_img_nodes) {
+                    size_t pos = 0;
+                    while ((pos = node.data.content.find("[CQ:image", pos)) != std::string::npos) {
+                        size_t end_pos = node.data.content.find(']', pos);
+                        if (end_pos == std::string::npos) break;
+                        if (pos > 0 && node.data.content[pos - 1] == '\n') {
+                            node.data.content.erase(pos - 1, end_pos - (pos - 1) + 1);
+                            pos = pos - 1;
+                        } else {
+                            node.data.content.erase(pos, end_pos - pos + 1);
+                        }
+                    }
+                }
+                rpc_client_.send_group_forward_msg(gid, no_img_nodes, [this, task_name, gid, item, today_str](const bot::protocol::SendGroupMsgResult& retry_res) {
+                    int64_t retry_msg_id = retry_res.success ? retry_res.message_id : 0;
+                    if (retry_msg_id > 0) {
+                        std::cout << "[DailyMusicManager] Pushed daily music forward card (no images) to group " << gid
+                                  << ", message_id=" << retry_msg_id << std::endl;
+                        db_.record_daily_push(task_name, gid, retry_msg_id,
+                                              item.item_id, item.item_name, item.artist_name,
+                                              item.platform, today_str, 0, retry_msg_id);
+                    } else {
+                        std::cerr << "[DailyMusicManager] Retry failed to send forward card to group " << gid
+                                  << ": " << retry_res.error_message << std::endl;
+                    }
+                });
             }
         });
-
-        // 2. 发送评价引导提示消息 (如：今日音乐推荐为\n「歌曲名」- 艺术家名...)
-        for (size_t m = 1; m < msgs.size(); ++m) {
-            rpc_client_.send_group_msg(gid, msgs[m]);
-        }
     }
 
     return any_success;

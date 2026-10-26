@@ -117,6 +117,9 @@ net::awaitable<void> message_consumer(
         if (raw_json.find("\"heartbeat\"") != std::string::npos) {
             HeartbeatEvent hb;
             if (!glz::read<bot::protocol::glaze_opts>(hb, raw_json)) {
+                if (hb.self_id > 0) {
+                    rpc_client.set_self_id(hb.self_id);
+                }
                 std::cout << "[Heartbeat] Self ID: " << hb.self_id 
                           << " | Interval: " << hb.interval << "ms | Connection Healthy." << std::endl;
             }
@@ -125,12 +128,18 @@ net::awaitable<void> message_consumer(
 
         // 2. 解析群消息事件 (派发给独立协程，保持主循环即时接收)
         if (auto group_event = bot::protocol::GroupMessageEvent::parse(raw_json)) {
+            if (group_event->self_id > 0) {
+                rpc_client.set_self_id(group_event->self_id);
+            }
             net::co_spawn(executor, handle_group_message(*group_event, rpc_client, music_module), net::detached);
             continue;
         }
 
         // 3. 解析私聊消息事件
         if (auto priv_event = bot::protocol::PrivateMessageEvent::parse(raw_json)) {
+            if (priv_event->self_id > 0) {
+                rpc_client.set_self_id(priv_event->self_id);
+            }
             std::cout << "[Private] "
                       << priv_event->sender.nickname << "(" << priv_event->user_id << ") "
                       << "[msg_id:" << priv_event->message_id << "]: "
@@ -155,6 +164,9 @@ net::awaitable<void> message_consumer(
 
         // 4. 解析群表情回应事件 (点赞/踩)
         if (auto reaction_event = bot::protocol::GroupReactionEvent::parse(raw_json)) {
+            if (reaction_event->self_id > 0) {
+                rpc_client.set_self_id(reaction_event->self_id);
+            }
             music_module.handle_group_reaction(*reaction_event);
             continue;
         }
@@ -179,6 +191,20 @@ int main() {
         bot::protocol::RpcClient rpc_client(ioc, [&](std::string msg) {
             server.send(std::move(msg));
         });
+
+        // 支持通过环境变量预设机器人自身 QQ 号 (用于展示自身头像)
+        const char* env_qq = std::getenv("BOT_QQ");
+        if (!env_qq) env_qq = std::getenv("QQ_BOT_UIN");
+        if (!env_qq) env_qq = std::getenv("BOT_UIN");
+        if (env_qq && *env_qq) {
+            try {
+                int64_t qqid = std::stoll(env_qq);
+                if (qqid > 0) {
+                    rpc_client.set_self_id(qqid);
+                    std::cout << "[Main] Initialized Bot self ID from environment: " << qqid << std::endl;
+                }
+            } catch (...) {}
+        }
 
         // 3. 创建并启动音乐订阅监控模块 (存储路径 data/bot_music.db，默认轮询周期 20 分钟)
         bot::module::music::MusicModule music_module(ioc, rpc_client, "data/bot_music.db", std::chrono::minutes(20));

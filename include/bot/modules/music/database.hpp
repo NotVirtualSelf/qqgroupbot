@@ -66,7 +66,8 @@ struct DailyPushedRecord {
     int64_t id{0};                   ///< 数据库自增主键 ID
     std::string task_name;           ///< 推荐任务名 (如 "netease_daily_song")
     int64_t group_id{0};             ///< 推送目标群号
-    int64_t message_id{0};           ///< 平台分配的消息 ID (用于表情回应定位)
+    int64_t message_id{0};           ///< 反馈数据来源消息 ID (用于表情回应定位)
+    int64_t card_message_id{0};      ///< 音乐转发卡片消息 ID (用于重复触发时引用回复)
     int64_t item_id{0};              ///< 推荐曲目/专辑 ID
     std::string item_name;           ///< 推荐曲目/专辑名称
     std::string artist_name;         ///< 艺术家名称
@@ -74,8 +75,8 @@ struct DailyPushedRecord {
     std::string pushed_date;         ///< 推送日期字符串 (YYYY-MM-DD)
     int64_t pushed_at{0};            ///< 推送时间戳 (秒)
     int evaluated{0};                ///< 是否已完成评价结算 (0 未结算，1 已结算)
-    int upvotes{0};                  ///< 点赞票数 (「对的对的」)
-    int downvotes{0};                ///< 踩票数 (「不对不对」)
+    int upvotes{0};                  ///< 点赞票数
+    int downvotes{0};                ///< 踩票数
 };
 
 /**
@@ -343,7 +344,17 @@ public:
      */
     int64_t record_daily_push(const std::string& task_name, int64_t group_id, int64_t message_id,
                               int64_t item_id, const std::string& item_name, const std::string& artist_name,
-                              const std::string& platform, const std::string& date, int64_t timestamp = 0);
+                              const std::string& platform, const std::string& date, int64_t timestamp = 0,
+                              int64_t card_message_id = 0);
+
+    /**
+     * @brief 更新某群当日推送记录的音乐卡片消息 ID
+     * @param group_id 群号
+     * @param date 日期字符串 (YYYY-MM-DD)
+     * @param card_message_id 音乐卡片消息 ID
+     * @return bool 是否更新成功
+     */
+    bool update_daily_push_card_message_id(int64_t group_id, const std::string& date, int64_t card_message_id);
 
     /**
      * @brief 根据 message_id 查询每日推荐推送记录
@@ -388,18 +399,21 @@ public:
      * @brief 记录或更新用户对每日推荐消息的表情回应
      * @param message_id 目标日推消息 ID
      * @param user_id 用户 QQ 号
-     * @param reaction_type 回应类型 (1 为点赞/对的对的, -1 为踩/不对不对)
+     * @param emoji_id 表情 ID / 标识 (支持单用户多表情独立记录)
+     * @param reaction_type 回应类型 (1 为点赞/好评, -1 为踩/差评)
      * @return bool 成功返回 true
      */
+    bool record_daily_reaction(int64_t message_id, int64_t user_id, const std::string& emoji_id, int reaction_type);
     bool record_daily_reaction(int64_t message_id, int64_t user_id, int reaction_type);
 
     /**
      * @brief 移除用户对每日推荐消息的表情回应 (用户撤销表情时调用)
      * @param message_id 目标日推消息 ID
      * @param user_id 用户 QQ 号
+     * @param emoji_id 表情 ID / 标识 (为空时移除该用户针对该消息的所有表情回应)
      * @return bool 成功返回 true
      */
-    bool remove_daily_reaction(int64_t message_id, int64_t user_id);
+    bool remove_daily_reaction(int64_t message_id, int64_t user_id, const std::string& emoji_id = "");
 
     /**
      * @brief 清空每日推荐消息的表情回应记录 (message_id 为 0 时清空全部)

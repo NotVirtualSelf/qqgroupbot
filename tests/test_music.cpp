@@ -745,6 +745,13 @@ int main() {
             assert(multi_nodes[4].data.content == "曲目一\n- 周杰伦\n- 03分45秒");
             assert(multi_nodes[5].data.name == "曲目 #2");
             assert(multi_nodes[5].data.content == "曲目二\n- 周杰伦 / 方文山\n- 03分45秒");
+
+            // 验证指定机器人自身 QQ 号展示自身头像
+            auto custom_uin_nodes = MusicModule::build_album_forward_nodes(single_alb, "123456789");
+            assert(custom_uin_nodes.size() == 4);
+            for (const auto& nd : custom_uin_nodes) {
+                assert(nd.data.uin == "123456789");
+            }
             std::cout << "[Test] Forward card nodes generation verified." << std::endl;
         }
 
@@ -1247,6 +1254,11 @@ int main() {
             MusicModule module(ioc, rpc, db_file);
             assert(module.start());
 
+            // 设置机器人自身 QQ 号为 888999111
+            rpc.set_self_id(888999111);
+            assert(rpc.self_id() == 888999111);
+            assert(rpc.self_uin() == "888999111");
+
             // 开启群 8888 每日音乐
             assert(module.get_database().set_daily_music_enabled(8888, true));
 
@@ -1256,15 +1268,18 @@ int main() {
             };
             module.get_netease_client().set_mock_daily_songs(mock_songs);
 
-            // 触发 11:00 推送 (包含音乐分享卡片与评价引导提示消息两条)
+            // 触发 11:00 推送 (合并转发卡片内包含评价引导提示与音乐卡片，转发人均为“每日推荐”)
             sent_payloads.clear();
             assert(module.get_daily_manager().trigger_push_now("netease_daily_song", 8888));
-            assert(sent_payloads.size() == 2);
+            assert(sent_payloads.size() == 1);
+            assert(sent_payloads[0].find("send_group_forward_msg") != std::string::npos);
+            assert(sent_payloads[0].find("今日音乐推荐为——") != std::string::npos);
+            assert(sent_payloads[0].find("「Ghost Voices」- Virtual Self") != std::string::npos);
+            assert(sent_payloads[0].find("➫ 你可以对这次日推使用表情回应，让下次的音乐推荐更精准。") != std::string::npos);
             assert(sent_payloads[0].find("[CQ:music,type=163,id=186016]") != std::string::npos);
-            assert(sent_payloads[1].find("今日音乐推荐为\\n「Ghost Voices」- Virtual Self") != std::string::npos);
-            assert(sent_payloads[1].find("你可以通过表情回应「[CQ:face,id=478] / [CQ:face,id=479]」对该音乐做出评价") != std::string::npos);
-            std::cout << "[Test 7.4] 11:00 Push sent 1st daily song card: " << sent_payloads[0] << std::endl;
-            std::cout << "[Test 7.4] 11:00 Push sent 2nd prompt msg: " << sent_payloads[1] << std::endl;
+            assert(sent_payloads[0].find("每日推荐") != std::string::npos);
+            assert(sent_payloads[0].find("\"uin\":\"888999111\"") != std::string::npos); // 验证使用机器人自身头像
+            std::cout << "[Test 7.4] 11:00 Push sent forward card: " << sent_payloads[0] << std::endl;
 
             // 验证推送记录已入库且 message_id 正确
             auto push_rec = module.get_database().get_daily_push_by_message_id(555001);
@@ -1449,40 +1464,45 @@ int main() {
             bot::protocol::GroupMessageEvent ev;
             ev.group_id = 7777;
             ev.user_id = 200;
+            ev.self_id = 777888999; // 模拟当前事件来自机器人自身 QQ 777888999
 
-            // 1. 第一次触发 /日推：应转发音乐卡片与评价引导提示消息
+            // 1. 第一次触发 /日推：应发送合并转发卡片 (转发人均为“每日推荐”，头像为机器人自身)
             ev.raw_message = "/日推";
             sent_payloads.clear();
             assert(module.handle_group_message(ev));
-            assert(sent_payloads.size() == 2);
+            assert(sent_payloads.size() == 1);
+            assert(sent_payloads[0].find("send_group_forward_msg") != std::string::npos);
+            assert(sent_payloads[0].find("今日音乐推荐为——") != std::string::npos);
+            assert(sent_payloads[0].find("「Particle Arts」- Virtual Self") != std::string::npos);
+            assert(sent_payloads[0].find("➫ 你可以对这次日推使用表情回应，让下次的音乐推荐更精准。") != std::string::npos);
             assert(sent_payloads[0].find("[CQ:music,type=163,id=99901]") != std::string::npos);
-            assert(sent_payloads[1].find("今日音乐推荐为\\n「Particle Arts」- Virtual Self") != std::string::npos);
-            assert(sent_payloads[1].find("你可以通过表情回应「[CQ:face,id=478] / [CQ:face,id=479]」对该音乐做出评价") != std::string::npos);
-            int64_t first_msg_id = 555101; // 第一条日推音乐卡片的 message_id (用于后续引用回复与状态统计)
-            std::cout << "[Test 7.7] First /日推 sent music card with msg_id=" << first_msg_id << std::endl;
+            assert(sent_payloads[0].find("每日推荐") != std::string::npos);
+            assert(sent_payloads[0].find("\"uin\":\"777888999\"") != std::string::npos); // 验证使用机器人自身的 QQ 头像
+            int64_t forward_msg_id = 555101; // 合并转发卡片的 message_id (反馈数据来源与重复引用目标)
+            std::cout << "[Test 7.7] First /日推 sent forward card msg_id=" << forward_msg_id << std::endl;
 
-            // 2. 第二次触发 /日推：应引用（回复）第一条日推信息
+            // 2. 第二次触发 /日推：应引用（回复）转发卡片的那条信息 (forward_msg_id)
             ev.raw_message = "/日推";
             sent_payloads.clear();
             assert(module.handle_group_message(ev));
             assert(!sent_payloads.empty());
-            std::string expected_reply = "[CQ:reply,id=" + std::to_string(first_msg_id) + "]今日日推歌曲为「Particle Arts」- Virtual Self";
+            std::string expected_reply = "[CQ:reply,id=" + std::to_string(forward_msg_id) + "]今日音乐推荐为——\\n「Particle Arts」- Virtual Self";
             assert(sent_payloads[0].find(expected_reply) != std::string::npos);
             int64_t second_msg_id = next_msg_id;
             std::cout << "[Test 7.7] Second /日推 sent quote reply: " << sent_payloads[0] << std::endl;
 
-            // 3. 验证表情回应：只有第一条信息下的反应被计入日推状态
-            // 3.1 给第一条消息 (first_msg_id) 点赞 2 次
+            // 3. 验证表情回应：仅转发卡片下的反应被计入日推状态
+            // 3.1 给转发卡片消息 (forward_msg_id) 点赞 2 次
             for (int u = 1; u <= 2; ++u) {
                 bot::protocol::GroupReactionEvent r_ev;
                 r_ev.group_id = 7777;
                 r_ev.user_id = 3000 + u;
-                r_ev.message_id = first_msg_id;
+                r_ev.message_id = forward_msg_id;
                 r_ev.emoji_id = "478";
                 r_ev.is_add = true;
                 assert(module.handle_group_reaction(r_ev));
             }
-            // 3.2 尝试给第二条引用回复消息 (second_msg_id) 点赞/踩，不应计入日推数据
+            // 3.2 尝试给引用回复消息 (second_msg_id) 点赞/踩，不应计入日推数据
             {
                 bot::protocol::GroupReactionEvent r_ev;
                 r_ev.group_id = 7777;
@@ -1492,7 +1512,7 @@ int main() {
                 r_ev.is_add = true;
                 module.handle_group_reaction(r_ev);
             }
-            auto [first_up, first_down] = module.get_database().get_daily_push_votes(first_msg_id);
+            auto [first_up, first_down] = module.get_database().get_daily_push_votes(forward_msg_id);
             assert(first_up == 2 && first_down == 0);
 
             // 4. 触发结算：第一次结算成功，清空反应数据与状态标记
@@ -1558,10 +1578,13 @@ int main() {
             ev.raw_message = "/日推";
             sent_payloads.clear();
             assert(module.handle_group_message(ev));
-            assert(sent_payloads.size() == 2);
+            assert(sent_payloads.size() == 1);
+            assert(sent_payloads[0].find("send_group_forward_msg") != std::string::npos);
+            assert(sent_payloads[0].find("今日音乐推荐为——") != std::string::npos);
+            assert(sent_payloads[0].find("「Early Song」- Artist A") != std::string::npos);
             assert(sent_payloads[0].find("[CQ:music,type=163,id=88801]") != std::string::npos);
-            assert(sent_payloads[1].find("今日音乐推荐为\\n「Early Song」- Artist A") != std::string::npos);
-            int64_t manual_msg_id = 666001; // 第一次手动发送记录的 message_id
+            assert(sent_payloads[0].find("每日推荐") != std::string::npos);
+            int64_t manual_forward_msg_id = 666001; // 第一次手动发送记录的 forward_message_id
 
             // 2. 模拟默认推送触发 (target_group = 0 全群定时推送)
             // 由于该群已在默认推送前手动触发，应当被跳过，不再重复发送默认推送！
@@ -1569,25 +1592,25 @@ int main() {
             module.get_daily_manager().trigger_push_now("netease_daily_song", 0);
             assert(sent_payloads.empty()); // 证实未重复发送！
 
-            // 3. 用户在群内再次触发 /日推，应将第一次手动触发的当作第一个，引用回复它
+            // 3. 用户在群内再次触发 /日推，应将第一次手动触发的当作第一个，引用回复转发卡片
             ev.raw_message = "/日推";
             sent_payloads.clear();
             assert(module.handle_group_message(ev));
             assert(sent_payloads.size() == 1);
-            std::string expected_reply = "[CQ:reply,id=" + std::to_string(manual_msg_id) + "]今日日推歌曲为「Early Song」- Artist A";
+            std::string expected_reply = "[CQ:reply,id=" + std::to_string(manual_forward_msg_id) + "]今日音乐推荐为——\\n「Early Song」- Artist A";
             assert(sent_payloads[0].find(expected_reply) != std::string::npos);
 
-            // 4. 用户给首次手动推送 (manual_msg_id) 点赞
+            // 4. 用户给首次手动推送 (manual_forward_msg_id) 点赞
             {
                 bot::protocol::GroupReactionEvent r_ev;
                 r_ev.group_id = 8888;
                 r_ev.user_id = 301;
-                r_ev.message_id = manual_msg_id;
+                r_ev.message_id = manual_forward_msg_id;
                 r_ev.emoji_id = "478";
                 r_ev.is_add = true;
                 assert(module.handle_group_reaction(r_ev));
             }
-            auto [up_before, down_before] = module.get_database().get_daily_push_votes(manual_msg_id);
+            auto [up_before, down_before] = module.get_database().get_daily_push_votes(manual_forward_msg_id);
             assert(up_before == 1);
 
             // 5. 执行结算
@@ -1610,7 +1633,7 @@ int main() {
             std::string today_str = DailyMusicManager::get_current_date_str();
             assert(!module.get_database().get_today_daily_push(8888, today_str).has_value());
             assert(!module.get_database().is_daily_evaluated(8888, today_str));
-            auto [up_after, down_after] = module.get_database().get_daily_push_votes(manual_msg_id);
+            auto [up_after, down_after] = module.get_database().get_daily_push_votes(manual_forward_msg_id);
             assert(up_after == 0 && down_after == 0); // 关联表情投票也已清空
 
             // 6.1 模拟已过默认结算时间 (如 23:45)，重置应被拦截拒绝
@@ -1621,14 +1644,16 @@ int main() {
             assert(!sent_payloads.empty());
             assert(sent_payloads[0].find("已过日推默认结算时间，不可进行重置") != std::string::npos);
 
-            // 7. 重置后再次触发 /日推：模拟 16:00 当作当天没发送过日推，发送全新第一条音乐卡片与提示
+            // 7. 重置后再次触发 /日推：模拟 16:00 当作当天没发送过日推，发送全新第一条转发卡片
             DailyMusicManager::set_mock_time(std::make_pair(16, 0));
             ev.raw_message = "/日推";
             sent_payloads.clear();
             assert(module.handle_group_message(ev));
-            assert(sent_payloads.size() == 2);
+            assert(sent_payloads.size() == 1);
+            assert(sent_payloads[0].find("send_group_forward_msg") != std::string::npos);
+            assert(sent_payloads[0].find("今日音乐推荐为——") != std::string::npos);
+            assert(sent_payloads[0].find("「Early Song」- Artist A") != std::string::npos);
             assert(sent_payloads[0].find("[CQ:music,type=163,id=88801]") != std::string::npos);
-            assert(sent_payloads[1].find("今日音乐推荐为\\n「Early Song」- Artist A") != std::string::npos);
             DailyMusicManager::set_mock_time(std::nullopt);
 
             std::filesystem::remove(db_file);
@@ -2365,7 +2390,9 @@ int main() {
             ev10.raw_message = "/日推";
             sent_payloads.clear();
             assert(module.handle_group_message(ev10));
-            assert(!sent_payloads.empty());
+            assert(sent_payloads.size() == 1);
+            assert(sent_payloads[0].find("send_group_forward_msg") != std::string::npos);
+            assert(sent_payloads[0].find("Shared Song 1") != std::string::npos);
             assert(sent_payloads[0].find("123321") != std::string::npos);
             std::string today_str = DailyMusicManager::get_current_date_str();
             auto push10 = module.get_database().get_today_daily_push(1022206916, today_str);
@@ -2379,7 +2406,9 @@ int main() {
             ev88.raw_message = "/日推";
             sent_payloads.clear();
             assert(module.handle_group_message(ev88));
-            assert(!sent_payloads.empty());
+            assert(sent_payloads.size() == 1);
+            assert(sent_payloads[0].find("send_group_forward_msg") != std::string::npos);
+            assert(sent_payloads[0].find("Shared Song 2") != std::string::npos);
             assert(sent_payloads[0].find("123322") != std::string::npos);
             auto push88 = module.get_database().get_today_daily_push(888888, today_str);
             assert(push88.has_value());
@@ -2415,7 +2444,7 @@ int main() {
             sent_payloads.clear();
             assert(module.handle_group_message(ev10));
             assert(!sent_payloads.empty());
-            assert(sent_payloads[0].find("👍 2 / 👎 1") != std::string::npos);
+            assert(sent_payloads[0].find("反馈数据：[+1]") != std::string::npos);
             assert(sent_payloads[0].find("Shared Song 1") != std::string::npos);
 
             // 6. 在群 888888 查询 /日推 状态：赞显示 3，踩显示 0 (评价数据不互通)
@@ -2423,7 +2452,7 @@ int main() {
             sent_payloads.clear();
             assert(module.handle_group_message(ev88));
             assert(!sent_payloads.empty());
-            assert(sent_payloads[0].find("👍 3 / 👎 0") != std::string::npos);
+            assert(sent_payloads[0].find("反馈数据：[+3]") != std::string::npos);
             assert(sent_payloads[0].find("Shared Song 2") != std::string::npos);
 
             // 7. 管理员在群 1022206916 手动执行 /日推 结算：仅结算该群
@@ -2570,7 +2599,7 @@ int main() {
         sent_payloads.clear();
         assert(module.handle_group_message(ev));
         assert(sent_payloads[0].find("今日音乐推荐：\\n<今日暂未推送>") != std::string::npos);
-        assert(sent_payloads[0].find("投票反馈：👍 0 / 👎 0") != std::string::npos);
+        assert(sent_payloads[0].find("反馈数据：[+0]") != std::string::npos);
         assert(sent_payloads[0].find("评价状态：待 22:30 结算") != std::string::npos);
         assert(sent_payloads[0].find("推送时间：<今日暂未推送>") != std::string::npos);
 
@@ -2585,8 +2614,12 @@ int main() {
         ev.raw_message = "/日推";
         sent_payloads.clear();
         assert(module.handle_group_message(ev));
-        assert(sent_payloads.size() == 2);
+        assert(sent_payloads.size() == 1);
+        assert(sent_payloads[0].find("send_group_forward_msg") != std::string::npos);
+        assert(sent_payloads[0].find("今日音乐推荐为——") != std::string::npos);
+        assert(sent_payloads[0].find("「Shelter」- Porter Robinson") != std::string::npos);
         assert(sent_payloads[0].find("[CQ:music,type=163,id=66601]") != std::string::npos);
+        assert(sent_payloads[0].find("每日推荐") != std::string::npos);
         std::string today_cycle = DailyMusicManager::get_current_date_str();
         auto push_entry = module.get_database().get_today_daily_push(9988, today_cycle);
         assert(push_entry.has_value());
@@ -2613,7 +2646,7 @@ int main() {
         ev.raw_message = "/日推 状态";
         sent_payloads.clear();
         assert(module.handle_group_message(ev));
-        assert(sent_payloads[0].find("投票反馈：👍 1 / 👎 0") != std::string::npos);
+        assert(sent_payloads[0].find("反馈数据：[+1]") != std::string::npos);
 
         // 3) 执行结算
         ev.raw_message = "/日推 结算";
@@ -2626,7 +2659,7 @@ int main() {
         sent_payloads.clear();
         assert(module.handle_group_message(ev));
         assert(sent_payloads[0].find("今日音乐推荐：\\n「Shelter」- Porter Robinson") != std::string::npos);
-        assert(sent_payloads[0].find("投票反馈：👍 1 / 👎 0") != std::string::npos);
+        assert(sent_payloads[0].find("反馈数据：[+1]") != std::string::npos);
         assert(sent_payloads[0].find("评价状态：<已结束评价>") != std::string::npos);
 
         // 10.4 验证重置时间边界与重置效果
@@ -2650,7 +2683,7 @@ int main() {
         assert(module.handle_group_message(ev));
         assert(sent_payloads[0].find("今日音乐推荐：\\n<今日暂未推送>") != std::string::npos);
         assert(sent_payloads[0].find("推送时间：<今日暂未推送>") != std::string::npos);
-        assert(sent_payloads[0].find("投票反馈：👍 0 / 👎 0") != std::string::npos);
+        assert(sent_payloads[0].find("反馈数据：[+0]") != std::string::npos);
         assert(sent_payloads[0].find("评价状态：待 22:30 结算") != std::string::npos);
 
         // 恢复真实时间
@@ -2796,6 +2829,266 @@ int main() {
 
         std::filesystem::remove(db_file);
         std::cout << "[Test 11] Admin permissions, linear probing slots & limit handling verified successfully!" << std::endl;
+    }
+
+    // ----------------------------------------------------
+    // Test 12: 扩充后的多点赞表情（含 🐛、🐋、🐍、🧊、✈️、/拜谢 等）与精选 4 类差评表情（/不对不对、/续标识、❔、/棒棒糖）
+    // ----------------------------------------------------
+    {
+        std::cout << "\n[Test 12] Testing Expanded Like Reactions & Selective Dislike Reactions..." << std::endl;
+        boost::asio::io_context ioc;
+        std::vector<std::string> sent_payloads;
+        int64_t next_msg_id = 888000;
+        bot::protocol::RpcClient rpc(ioc, [&](std::string msg) {
+            sent_payloads.push_back(msg);
+            auto echo_pos = msg.find("\"echo\":\"");
+            if (echo_pos != std::string::npos) {
+                std::string echo = msg.substr(echo_pos + 8, 36);
+                std::string reply = R"({"status":"ok","retcode":0,"data":{"message_id":)" + std::to_string(++next_msg_id) + R"(},"echo":")" + echo + "\"}";
+                rpc.handle_response(reply);
+            }
+        });
+
+        std::string db_file = "test_reaction_emojis.db";
+        std::filesystem::remove(db_file);
+        MusicModule module(ioc, rpc, db_file);
+        assert(module.start());
+
+        int64_t test_group = 777777;
+        module.add_known_group(test_group);
+        assert(module.get_database().set_daily_music_enabled(test_group, true));
+        assert(module.get_database().set_group_netease_account(test_group, "MUSIC_U=dummy;", "TestUser", 112233, false, 0));
+
+        std::vector<DailySongItem> mock_songs = {
+            {55555, "Reaction Test Song", "Artist", "http://test.jpg", "日推"}
+        };
+        module.get_netease_client().set_mock_daily_songs(mock_songs);
+
+        bot::protocol::GroupMessageEvent ev;
+        ev.group_id = test_group;
+        ev.user_id = 1000;
+        ev.raw_message = "/日推";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads.size() == 1);
+        assert(sent_payloads[0].find("send_group_forward_msg") != std::string::npos);
+        assert(sent_payloads[0].find("今日音乐推荐为——") != std::string::npos);
+        assert(sent_payloads[0].find("「Reaction Test Song」- Artist") != std::string::npos);
+        assert(sent_payloads[0].find("➫ 你可以对这次日推使用表情回应，让下次的音乐推荐更精准。") != std::string::npos);
+        assert(sent_payloads[0].find("[CQ:music,type=163,id=55555]") != std::string::npos);
+        assert(sent_payloads[0].find("每日推荐") != std::string::npos);
+
+        std::string today_cycle = DailyMusicManager::get_current_date_str();
+        auto push_rec = module.get_database().get_today_daily_push(test_group, today_cycle);
+        assert(push_rec.has_value());
+        int64_t msg_id = push_rec->message_id;
+
+        // 1. 测试各路点赞表情：🐛、🐋、🐍、🧊、✈️、297(/拜谢)、76(/赞)、66(/爱心)、👍
+        std::vector<std::string> test_likes = {
+            "🐛", "🐋", "🐍", "🧊", "✈️", "297", "76", "66", "👍"
+        };
+        int64_t uid_seed = 10000;
+        for (const auto& emoji : test_likes) {
+            bot::protocol::GroupReactionEvent r_ev;
+            r_ev.group_id = test_group;
+            r_ev.message_id = msg_id;
+            r_ev.emoji_id = emoji;
+            r_ev.user_id = ++uid_seed;
+            r_ev.is_add = true;
+            assert(module.handle_group_reaction(r_ev));
+        }
+
+        // 检查点赞数为 9，踩为 0
+        auto [up1, down1] = module.get_database().get_daily_push_votes(msg_id);
+        assert(up1 == 9);
+        assert(down1 == 0);
+
+        // 2. 测试精选的 4 类差评表情：/不对不对 (479)、/续标识 (424)、❔(以及 10068, 401145, 134, ?, 32, 268 等各类问号变体)、/棒棒糖 (147, 🍭)
+        std::vector<std::string> test_dislikes = {
+            "479", "424", "❔", "10068", "401145", "134", "?", "32", "268", "147", "🍭"
+        };
+        for (const auto& emoji : test_dislikes) {
+            bot::protocol::GroupReactionEvent r_ev;
+            r_ev.group_id = test_group;
+            r_ev.message_id = msg_id;
+            r_ev.emoji_id = emoji;
+            r_ev.user_id = ++uid_seed;
+            r_ev.is_add = true;
+            assert(module.handle_group_reaction(r_ev));
+        }
+
+        // 检查踩数增加 11
+        auto [up2, down2] = module.get_database().get_daily_push_votes(msg_id);
+        assert(up2 == 9);
+        assert(down2 == 11);
+
+        // 测试从原始 JSON 解析表情回应 (包含整型与字符串类型的 emoji_id)
+        {
+            std::string json_str_like = R"({"post_type":"notice","notice_type":"group_msg_emoji_like","group_id":777777,"user_id":99991,"message_id":)" + std::to_string(msg_id) + R"(,"likes":[{"emoji_id":"10068","count":1}],"is_add":true})";
+            auto parsed_ev = bot::protocol::GroupReactionEvent::parse(json_str_like);
+            assert(parsed_ev.has_value());
+            assert(parsed_ev->emoji_id == "10068");
+            assert(module.handle_group_reaction(*parsed_ev));
+
+            std::string json_num_like = R"({"post_type":"notice","notice_type":"group_msg_emoji_like","group_id":777777,"user_id":99992,"message_id":)" + std::to_string(msg_id) + R"(,"likes":[{"emoji_id":10068,"count":1}],"is_add":true})";
+            auto parsed_num_ev = bot::protocol::GroupReactionEvent::parse(json_num_like);
+            assert(parsed_num_ev.has_value());
+            assert(parsed_num_ev->emoji_id == "10068");
+            assert(module.handle_group_reaction(*parsed_num_ev));
+        }
+        auto [up_json, down_json] = module.get_database().get_daily_push_votes(msg_id);
+        assert(up_json == 9);
+        assert(down_json == 13);
+
+        // 3. 测试非候选表情（如 59 /便便、11 /发怒），确认被过滤不计入
+        std::vector<std::string> ignored_emojis = { "59", "11", "💩", "/发怒" };
+        for (const auto& emoji : ignored_emojis) {
+            bot::protocol::GroupReactionEvent r_ev;
+            r_ev.group_id = test_group;
+            r_ev.message_id = msg_id;
+            r_ev.emoji_id = emoji;
+            r_ev.user_id = ++uid_seed;
+            r_ev.is_add = true;
+            assert(module.handle_group_reaction(r_ev));
+        }
+        auto [up3, down3] = module.get_database().get_daily_push_votes(msg_id);
+        assert(up3 == 9);
+        assert(down3 == 13);
+
+        // 4. 查看状态面板：净分为 9 - 13 = -4 -> 显示 "反馈数据：[-4]"
+        ev.raw_message = "/日推 状态";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(!sent_payloads.empty());
+        assert(sent_payloads[0].find("反馈数据：[-4]") != std::string::npos);
+
+        // 5. 用户取消表情 (is_add = false)
+        bot::protocol::GroupReactionEvent un_ev;
+        un_ev.group_id = test_group;
+        un_ev.message_id = msg_id;
+        un_ev.emoji_id = "🐛";
+        un_ev.user_id = 10001; // 第一个点赞用户
+        un_ev.is_add = false;
+        assert(module.handle_group_reaction(un_ev));
+
+        // 净分变为 8 - 13 = -5
+        auto [up4, down4] = module.get_database().get_daily_push_votes(msg_id);
+        assert(up4 == 8);
+        assert(down4 == 13);
+
+        ev.raw_message = "/日推 状态";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("反馈数据：[-5]") != std::string::npos);
+
+        // 6. 测试同一用户对同一条推送回应多个表情（按表情数独立统计全部计入）与精准取消
+        int64_t multi_user = 666888;
+        // 当前 up4 = 8, down4 = 13
+        // 6.1 该用户回应点赞表情 "👍"
+        {
+            bot::protocol::GroupReactionEvent r;
+            r.group_id = test_group;
+            r.message_id = msg_id;
+            r.emoji_id = "👍";
+            r.user_id = multi_user;
+            r.is_add = true;
+            assert(module.handle_group_reaction(r));
+        }
+        auto [m_up1, m_down1] = module.get_database().get_daily_push_votes(msg_id);
+        assert(m_up1 == 9 && m_down1 == 13);
+
+        // 6.2 同一用户继续回应点赞表情 "🐋"
+        {
+            bot::protocol::GroupReactionEvent r;
+            r.group_id = test_group;
+            r.message_id = msg_id;
+            r.emoji_id = "🐋";
+            r.user_id = multi_user;
+            r.is_add = true;
+            assert(module.handle_group_reaction(r));
+        }
+        auto [m_up2, m_down2] = module.get_database().get_daily_push_votes(msg_id);
+        assert(m_up2 == 10 && m_down2 == 13); // 点赞数累加至 10
+
+        // 6.3 同一用户继续回应点赞表情 "66" (/爱心)
+        {
+            bot::protocol::GroupReactionEvent r;
+            r.group_id = test_group;
+            r.message_id = msg_id;
+            r.emoji_id = "66";
+            r.user_id = multi_user;
+            r.is_add = true;
+            assert(module.handle_group_reaction(r));
+        }
+        auto [m_up3, m_down3] = module.get_database().get_daily_push_votes(msg_id);
+        assert(m_up3 == 11 && m_down3 == 13); // 点赞数累加至 11
+
+        // 6.4 同一用户回应差评表情 "❔"
+        {
+            bot::protocol::GroupReactionEvent r;
+            r.group_id = test_group;
+            r.message_id = msg_id;
+            r.emoji_id = "❔";
+            r.user_id = multi_user;
+            r.is_add = true;
+            assert(module.handle_group_reaction(r));
+        }
+        auto [m_up4, m_down4] = module.get_database().get_daily_push_votes(msg_id);
+        assert(m_up4 == 11 && m_down4 == 14); // 差评数累加至 14
+
+        // 6.5 同一用户重复回应相同表情 "👍" (去重保护，不应重复累加)
+        {
+            bot::protocol::GroupReactionEvent r;
+            r.group_id = test_group;
+            r.message_id = msg_id;
+            r.emoji_id = "👍";
+            r.user_id = multi_user;
+            r.is_add = true;
+            assert(module.handle_group_reaction(r));
+        }
+        auto [m_up5, m_down5] = module.get_database().get_daily_push_votes(msg_id);
+        assert(m_up5 == 11 && m_down5 == 14);
+
+        // 状态检查：11 - 14 = -3 -> "反馈数据：[-3]"
+        ev.raw_message = "/日推 状态";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("反馈数据：[-3]") != std::string::npos);
+
+        // 6.6 该用户仅取消 "🐋" 表情，其他表情不受影响
+        {
+            bot::protocol::GroupReactionEvent r;
+            r.group_id = test_group;
+            r.message_id = msg_id;
+            r.emoji_id = "🐋";
+            r.user_id = multi_user;
+            r.is_add = false;
+            assert(module.handle_group_reaction(r));
+        }
+        auto [m_up6, m_down6] = module.get_database().get_daily_push_votes(msg_id);
+        assert(m_up6 == 10 && m_down6 == 14); // 仅减去 🐋 的赞数，变为 10
+
+        // 6.7 该用户仅取消 "❔" 表情
+        {
+            bot::protocol::GroupReactionEvent r;
+            r.group_id = test_group;
+            r.message_id = msg_id;
+            r.emoji_id = "❔";
+            r.user_id = multi_user;
+            r.is_add = false;
+            assert(module.handle_group_reaction(r));
+        }
+        auto [m_up7, m_down7] = module.get_database().get_daily_push_votes(msg_id);
+        assert(m_up7 == 10 && m_down7 == 13); // 差评数减回 13
+
+        // 状态检查：10 - 13 = -3 -> "反馈数据：[-3]"
+        ev.raw_message = "/日推 状态";
+        sent_payloads.clear();
+        assert(module.handle_group_message(ev));
+        assert(sent_payloads[0].find("反馈数据：[-3]") != std::string::npos);
+
+        std::filesystem::remove(db_file);
+        std::cout << "[Test 12] Expanded like reactions & selective dislike reactions verified successfully!" << std::endl;
     }
 
     std::cout << "\n==============================================" << std::endl;

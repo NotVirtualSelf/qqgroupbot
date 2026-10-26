@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <string>
 #include <optional>
+#include <variant>
 #include <glaze/glaze.hpp>
 
 namespace bot::protocol {
@@ -118,8 +119,8 @@ struct RawApiResponse {
  * @brief 表情回应统计子项 (NapCat likes 结构)
  */
 struct ReactionLikeItem {
-    std::string emoji_id;        ///< 表情 ID 字符串
-    int count{0};                ///< 当前表情计数 (0 表示已取消回应)
+    std::variant<std::string, int64_t> emoji_id; ///< 表情 ID (支持字符串或整型数字)
+    int count{0};                                ///< 当前表情计数 (0 表示已取消回应)
 };
 
 /**
@@ -153,8 +154,8 @@ struct GroupReactionEvent {
         int64_t group_id{0};
         int64_t user_id{0};
         int64_t message_id{0};
-        std::optional<std::string> code;
-        std::optional<std::string> emoji_id;
+        std::optional<std::variant<std::string, int64_t>> code;
+        std::optional<std::variant<std::string, int64_t>> emoji_id;
         std::optional<int64_t> face_id;
         std::optional<bool> is_add;
         std::vector<ReactionLikeItem> likes;
@@ -191,14 +192,21 @@ struct GroupReactionEvent {
         ev.user_id = raw.user_id;
         ev.message_id = raw.message_id;
 
-        if (raw.code && !raw.code->empty()) {
-            ev.code = *raw.code;
-        } else if (raw.emoji_id && !raw.emoji_id->empty()) {
-            ev.code = *raw.emoji_id;
+        auto get_str_val = [](const std::variant<std::string, int64_t>& v) -> std::string {
+            if (std::holds_alternative<std::string>(v)) {
+                return std::get<std::string>(v);
+            }
+            return std::to_string(std::get<int64_t>(v));
+        };
+
+        if (raw.code) {
+            ev.code = get_str_val(*raw.code);
+        } else if (raw.emoji_id) {
+            ev.code = get_str_val(*raw.emoji_id);
         } else if (raw.face_id) {
             ev.code = std::to_string(*raw.face_id);
-        } else if (!raw.likes.empty() && !raw.likes[0].emoji_id.empty()) {
-            ev.code = raw.likes[0].emoji_id;
+        } else if (!raw.likes.empty()) {
+            ev.code = get_str_val(raw.likes[0].emoji_id);
         }
         ev.emoji_id = ev.code;
 

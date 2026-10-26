@@ -342,6 +342,9 @@ void MusicModule::stop() {
 }
 
 bool MusicModule::handle_group_reaction(const bot::protocol::GroupReactionEvent& event) {
+    if (event.self_id > 0) {
+        rpc_client_.set_self_id(event.self_id);
+    }
     add_known_group(event.group_id);
     if (daily_manager_) {
         daily_manager_->handle_reaction(event);
@@ -445,7 +448,11 @@ std::string MusicModule::format_total_duration(int64_t duration_ms) {
     return std::string(buf);
 }
 
-std::vector<bot::protocol::ForwardNode> MusicModule::build_album_forward_nodes(const AlbumDetail& album) {
+std::string MusicModule::get_bot_uin() const {
+    return rpc_client_.self_uin();
+}
+
+std::vector<bot::protocol::ForwardNode> MusicModule::build_album_forward_nodes(const AlbumDetail& album, const std::string& bot_uin) {
     std::vector<bot::protocol::ForwardNode> nodes;
 
     // 只有一首单曲时：判定为新单曲卡片
@@ -456,7 +463,7 @@ std::vector<bot::protocol::ForwardNode> MusicModule::build_album_forward_nodes(c
         {
             bot::protocol::ForwardNode node;
             node.data.name = "封面";
-            node.data.uin = "2854196306";
+            node.data.uin = bot_uin;
             node.data.content = !album.pic_url.empty() ? ("[CQ:image,file=" + album.pic_url + "]") : "（暂无封面）";
             nodes.push_back(std::move(node));
         }
@@ -465,7 +472,7 @@ std::vector<bot::protocol::ForwardNode> MusicModule::build_album_forward_nodes(c
         {
             bot::protocol::ForwardNode node;
             node.data.name = "单曲";
-            node.data.uin = "2854196306";
+            node.data.uin = bot_uin;
             std::string song_name = !track.name.empty() ? track.name : album.name;
             node.data.content = "「" + song_name + "」";
             nodes.push_back(std::move(node));
@@ -475,7 +482,7 @@ std::vector<bot::protocol::ForwardNode> MusicModule::build_album_forward_nodes(c
         {
             bot::protocol::ForwardNode node;
             node.data.name = "创作者";
-            node.data.uin = "2854196306";
+            node.data.uin = bot_uin;
             std::string creator = !track.artist_name.empty() ? track.artist_name : album.artist_name;
             node.data.content = "「" + creator + "」";
             nodes.push_back(std::move(node));
@@ -485,7 +492,7 @@ std::vector<bot::protocol::ForwardNode> MusicModule::build_album_forward_nodes(c
         {
             bot::protocol::ForwardNode node;
             node.data.name = "基本信息";
-            node.data.uin = "2854196306";
+            node.data.uin = bot_uin;
             node.data.content = "「" + format_track_duration(track.duration_ms) + "」";
             nodes.push_back(std::move(node));
         }
@@ -498,7 +505,7 @@ std::vector<bot::protocol::ForwardNode> MusicModule::build_album_forward_nodes(c
     {
         bot::protocol::ForwardNode node;
         node.data.name = "封面";
-        node.data.uin = "2854196306";
+        node.data.uin = bot_uin;
         node.data.content = !album.pic_url.empty() ? ("[CQ:image,file=" + album.pic_url + "]") : "（暂无封面）";
         nodes.push_back(std::move(node));
     }
@@ -507,7 +514,7 @@ std::vector<bot::protocol::ForwardNode> MusicModule::build_album_forward_nodes(c
     {
         bot::protocol::ForwardNode node;
         node.data.name = "专辑";
-        node.data.uin = "2854196306";
+        node.data.uin = bot_uin;
         node.data.content = "「" + album.name + "」";
         nodes.push_back(std::move(node));
     }
@@ -516,7 +523,7 @@ std::vector<bot::protocol::ForwardNode> MusicModule::build_album_forward_nodes(c
     {
         bot::protocol::ForwardNode node;
         node.data.name = "创作者";
-        node.data.uin = "2854196306";
+        node.data.uin = bot_uin;
         node.data.content = "「" + album.artist_name + "」";
         nodes.push_back(std::move(node));
     }
@@ -525,7 +532,7 @@ std::vector<bot::protocol::ForwardNode> MusicModule::build_album_forward_nodes(c
     {
         bot::protocol::ForwardNode node;
         node.data.name = "基本信息";
-        node.data.uin = "2854196306";
+        node.data.uin = bot_uin;
         node.data.content = "「" + std::to_string(album.tracks.size()) + "首 · " + format_total_duration(album.total_duration_ms) + "」";
         nodes.push_back(std::move(node));
     }
@@ -535,7 +542,7 @@ std::vector<bot::protocol::ForwardNode> MusicModule::build_album_forward_nodes(c
         const auto& track = album.tracks[i];
         bot::protocol::ForwardNode node;
         node.data.name = "曲目 #" + std::to_string(i + 1);
-        node.data.uin = "2854196306";
+        node.data.uin = bot_uin;
         std::string creator = !track.artist_name.empty() ? track.artist_name : album.artist_name;
         node.data.content = track.name + "\n- " + creator + "\n- " + format_track_duration(track.duration_ms);
         nodes.push_back(std::move(node));
@@ -661,7 +668,7 @@ void MusicModule::check_new_albums_once(int64_t target_group) {
                 : ("关注的艺术家【" + artist.artist_name + "】在【" + platform_display + "】发布了新专辑！");
 
             // 2. 构造合并转发卡片节点
-            auto forward_nodes = build_album_forward_nodes(detail);
+            auto forward_nodes = build_album_forward_nodes(detail, get_bot_uin());
 
             // 3. 构造平台音乐分享 CQ 码
             std::string share_msg;
@@ -998,6 +1005,9 @@ bool MusicModule::handle_candidate_selection(const bot::protocol::GroupMessageEv
 }
 
 bool MusicModule::handle_group_message(const bot::protocol::GroupMessageEvent& event) {
+    if (event.self_id > 0) {
+        rpc_client_.set_self_id(event.self_id);
+    }
     add_known_group(event.group_id);
     std::string text = trim(event.raw_message);
     if (text.empty()) return false;
@@ -1144,7 +1154,7 @@ bool MusicModule::handle_group_message(const bot::protocol::GroupMessageEvent& e
         {
             bot::protocol::ForwardNode title_node;
             title_node.data.name = "音乐搜索助手";
-            title_node.data.uin = "2854196306";
+            title_node.data.uin = get_bot_uin();
             title_node.data.content = "🔍【" + platform_display + "】搜索结果：";
             forward_nodes.push_back(std::move(title_node));
         }
@@ -1154,7 +1164,7 @@ bool MusicModule::handle_group_message(const bot::protocol::GroupMessageEvent& e
             const auto& cand = candidates[i];
             bot::protocol::ForwardNode node;
             node.data.name = "候选艺术家 #" + std::to_string(i + 1);
-            node.data.uin = "2854196306";
+            node.data.uin = get_bot_uin();
 
             std::ostringstream node_oss;
             node_oss << cand.name << " (ID: " << cand.id << ")";
@@ -1330,7 +1340,7 @@ bool MusicModule::handle_group_message(const bot::protocol::GroupMessageEvent& e
         {
             bot::protocol::ForwardNode title_node;
             title_node.data.name = "音乐搜索助手";
-            title_node.data.uin = "2854196306";
+            title_node.data.uin = get_bot_uin();
             title_node.data.content = "🔍 发现多个同名艺术家，请选择要取关的项：";
             forward_nodes.push_back(std::move(title_node));
         }
@@ -1340,7 +1350,7 @@ bool MusicModule::handle_group_message(const bot::protocol::GroupMessageEvent& e
             const auto& cand = candidates[i];
             bot::protocol::ForwardNode node;
             node.data.name = "候选艺术家 #" + std::to_string(i + 1);
-            node.data.uin = "2854196306";
+            node.data.uin = get_bot_uin();
 
             std::ostringstream node_oss;
             node_oss << cand.name << " (ID: " << cand.id << ")";
@@ -1413,7 +1423,7 @@ bool MusicModule::handle_group_message(const bot::protocol::GroupMessageEvent& e
         for (size_t p = 0; p < total_pages; ++p) {
             bot::protocol::ForwardNode page_node;
             page_node.data.name = (total_pages == 1) ? "关注列表" : ("关注列表页 #" + std::to_string(p + 1));
-            page_node.data.uin = "2854196306";
+            page_node.data.uin = get_bot_uin();
 
             std::ostringstream page_oss;
             size_t start_idx = p * page_size;
@@ -1591,7 +1601,9 @@ bool MusicModule::handle_group_message(const bot::protocol::GroupMessageEvent& e
                 auto [up, down] = today_push->evaluated ?
                     std::pair<int, int>{today_push->upvotes, today_push->downvotes} :
                     db_.get_daily_push_votes(today_push->message_id);
-                msg += "投票反馈：👍 " + std::to_string(up) + " / 👎 " + std::to_string(down) + "\n";
+                int score = up - down;
+                std::string score_str = (score >= 0 ? "+" : "") + std::to_string(score);
+                msg += "反馈数据：[" + score_str + "]\n";
 
                 if (today_push->evaluated) {
                     msg += "评价状态：<已结束评价>\n";
@@ -1613,7 +1625,7 @@ bool MusicModule::handle_group_message(const bot::protocol::GroupMessageEvent& e
                 msg += "推送时间：" + std::string(push_buf);
             } else {
                 msg += "<今日暂未推送>\n";
-                msg += "投票反馈：👍 0 / 👎 0\n";
+                msg += "反馈数据：[+0]\n";
                 char eval_buf[16];
                 std::snprintf(eval_buf, sizeof(eval_buf), "%02d:%02d", time_cfg.eval_hour, time_cfg.eval_minute);
                 msg += "评价状态：待 " + std::string(eval_buf) + " 结算\n";
@@ -1652,10 +1664,11 @@ bool MusicModule::handle_group_message(const bot::protocol::GroupMessageEvent& e
             auto time_cfg = db_.get_daily_music_time_config();
             std::string today_str = DailyMusicManager::get_current_date_str(time_cfg.update_hour, time_cfg.update_minute);
             auto today_push = db_.get_today_daily_push(event.group_id, today_str);
-            if (today_push.has_value() && today_push->message_id > 0) {
-                // 后续触发：QQ群内对第一条日推信息（即转发的音乐）进行引用（回复）
-                std::string reply_msg = "[CQ:reply,id=" + std::to_string(today_push->message_id) + "]"
-                                      + "今日日推歌曲为「" + today_push->item_name + "」- " + today_push->artist_name;
+            if (today_push.has_value() && (today_push->message_id > 0 || today_push->card_message_id > 0)) {
+                // 后续触发：QQ群内对第一条日推信息（即转发卡片）进行引用（回复）
+                int64_t reply_id = (today_push->message_id > 0) ? today_push->message_id : today_push->card_message_id;
+                std::string reply_msg = "[CQ:reply,id=" + std::to_string(reply_id) + "]"
+                                      + "今日音乐推荐为——\n「" + today_push->item_name + "」- " + today_push->artist_name;
                 rpc_client_.send_group_msg(event.group_id, reply_msg);
                 return true;
             }
@@ -1673,6 +1686,9 @@ bool MusicModule::handle_group_message(const bot::protocol::GroupMessageEvent& e
 }
 
 bool MusicModule::handle_private_message(const bot::protocol::PrivateMessageEvent& event) {
+    if (event.self_id > 0) {
+        rpc_client_.set_self_id(event.self_id);
+    }
     std::string text = trim(event.raw_message);
     if (text.empty()) return false;
 

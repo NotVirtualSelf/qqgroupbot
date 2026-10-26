@@ -141,6 +141,24 @@ public:
      */
     size_t pending_count() const;
 
+    /**
+     * @brief 设置机器人自身 QQ 号 (用于合并转发节点等展示机器人自身头像)
+     * @param self_id 机器人自身的 QQ 号
+     */
+    void set_self_id(int64_t self_id);
+
+    /**
+     * @brief 获取机器人自身 QQ 号
+     * @return int64_t 机器人自身 QQ 号 (未设置时返回 0)
+     */
+    int64_t self_id() const;
+
+    /**
+     * @brief 获取机器人自身 QQ 号字符串 (未设置时返回空字符串)
+     * @return std::string 机器人自身 QQ 号字符串
+     */
+    std::string self_uin() const;
+
 private:
     std::shared_ptr<RpcClientImpl> impl_;
 };

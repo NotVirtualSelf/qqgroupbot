@@ -12,6 +12,7 @@
 #include <memory>
 #include <cstdint>
 #include <iostream>
+#include "bot/protocol/actions.hpp"
 #include "bot/modules/music/database.hpp"
 #include "bot/modules/music/netease_client.hpp"
 
@@ -154,6 +155,29 @@ public:
     virtual std::vector<std::string> build_push_messages(const DailyRecommendationItem& item) = 0;
 
     /**
+     * @brief 构建推送消息的合并转发节点列表 (顺序不变，转发人均为“每日推荐”)
+     * @param item 推荐数据项
+     * @param sender_name 发送者昵称 (默认“每日推荐”)
+     * @param sender_uin 发送者 QQ 号 (默认为空，展示机器人自身头像)
+     * @return std::vector<bot::protocol::ForwardNode> 合并转发节点列表
+     */
+    virtual std::vector<bot::protocol::ForwardNode> build_push_forward_nodes(
+        const DailyRecommendationItem& item,
+        const std::string& sender_name = "每日推荐",
+        const std::string& sender_uin = "") {
+        auto msgs = build_push_messages(item);
+        std::vector<bot::protocol::ForwardNode> nodes;
+        for (const auto& msg : msgs) {
+            bot::protocol::ForwardNode node;
+            node.data.name = sender_name;
+            node.data.uin = sender_uin;
+            node.data.content = msg;
+            nodes.push_back(std::move(node));
+        }
+        return nodes;
+    }
+
+    /**
      * @brief 执行评价反馈操作 (如点赞或减少推荐)
      * @param item 目标推荐项
      * @param action 评价动作 (Like / Dislike / None)
@@ -273,12 +297,20 @@ public:
     }
 
     std::vector<std::string> build_push_messages(const DailyRecommendationItem& item) override {
-        // 1. 网易云音乐卡片 [CQ:music,type=163,id={song_id}]
+        // 1. 标题 (独立内容)
+        std::string intro = "今日音乐推荐为——";
+
+        // 2. 歌曲详情与评价引导说明 (封面及引导文案)
+        std::string detail = "「" + item.item_name + "」- " + item.artist_name;
+        if (!item.pic_url.empty()) {
+            detail += "\n[CQ:image,file=" + item.pic_url + "]";
+        }
+        detail += "\n➫ 你可以对这次日推使用表情回应，让下次的音乐推荐更精准。";
+
+        // 3. 网易云音乐卡片 [CQ:music,type=163,id={song_id}]
         std::string card = "[CQ:music,type=163,id=" + std::to_string(item.item_id) + "]";
-        // 2. 评价引导说明 (先发卡片再发引导说明)
-        std::string prompt = "今日音乐推荐为\n「" + item.item_name + "」- " + item.artist_name + "\n"
-                           + "你可以通过表情回应「[CQ:face,id=478] / [CQ:face,id=479]」对该音乐做出评价";
-        return { card, prompt };
+
+        return { intro, detail, card };
     }
 
     bool execute_evaluation(const DailyRecommendationItem& item, DailyEvalAction action, std::string& result_msg) override {

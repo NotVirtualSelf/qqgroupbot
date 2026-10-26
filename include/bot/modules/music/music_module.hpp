@@ -162,9 +162,18 @@ public:
     /**
      * @brief 构造新专辑/新单曲通知合并转发卡片节点列表
      * @param album 专辑/单曲详情
+     * @param bot_uin 转发节点发送者 QQ 号 (默认为空，展示机器人自身头像)
      * @return std::vector<bot::protocol::ForwardNode> 转发卡片节点列表
      */
-    static std::vector<bot::protocol::ForwardNode> build_album_forward_nodes(const AlbumDetail& album);
+    static std::vector<bot::protocol::ForwardNode> build_album_forward_nodes(
+        const AlbumDetail& album,
+        const std::string& bot_uin = "");
+
+    /**
+     * @brief 获取机器人自身 QQ 号字符串 (用于所有合并转发卡片展示机器人自身头像)
+     * @return std::string 自身 QQ 号字符串 (未获取到则返回空)
+     */
+    std::string get_bot_uin() const;
 
     /**
      * @brief 判断机器人是否在指定的 QQ 群中

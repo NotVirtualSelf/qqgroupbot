@@ -307,6 +307,21 @@ public:
         return true;
     }
 
+    void set_self_id(int64_t self_id) {
+        if (self_id > 0) {
+            self_id_.store(self_id);
+        }
+    }
+
+    int64_t self_id() const {
+        return self_id_.load();
+    }
+
+    std::string self_uin() const {
+        int64_t id = self_id_.load();
+        return id > 0 ? std::to_string(id) : "";
+    }
+
     size_t pending_count() const {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         return pending_requests_.size();
@@ -326,6 +341,7 @@ private:
 
     mutable std::mutex pending_mutex_;
     std::unordered_map<std::string, PendingEntry> pending_requests_;
+    std::atomic<int64_t> self_id_{0};
 };
 
 RpcClient::RpcClient(net::io_context& ioc, SendFunction send_fn)
@@ -374,6 +390,18 @@ bool RpcClient::handle_response(const std::string& raw_json) {
 
 size_t RpcClient::pending_count() const {
     return impl_->pending_count();
+}
+
+void RpcClient::set_self_id(int64_t self_id) {
+    impl_->set_self_id(self_id);
+}
+
+int64_t RpcClient::self_id() const {
+    return impl_->self_id();
+}
+
+std::string RpcClient::self_uin() const {
+    return impl_->self_uin();
 }
 
 } // namespace bot::protocol
