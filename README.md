@@ -299,8 +299,126 @@ cmake --build --preset conan-release
 docker compose up -d
 ```
 
-### 4. 启动机器人主程序
+---
+
+### 4. 机器人账号登录与网络配置指南（NapCat WebUI）
+
+NapCatQQ 容器化运行作为 OneBot 11 协议端，通过 WebUI 控制台提供直观的账号管理与网络连接配置。
+
+#### 4.1 端口说明与确认
+
+整个系统涉及两个关键端口，它们的用途与确认方式如下：
+
+| 端口号 | 监听方 | 访问/连接方向 | 作用说明 | 确认与查看方式 |
+| :--- | :--- | :--- | :--- | :--- |
+| **6099** | NapCat WebUI（容器内部） | 浏览器 $\to$ 容器 `6099` | 网页端管理后台，用于扫码登录 QQ、管理网络配置 | 检查 [docker-compose.yml](file:///home/virtualself/Projects/qq-bot/docker-compose.yml) 中的 `ports: - "6099:6099"` 以及 [webui.json](file:///home/virtualself/Projects/qq-bot/napcat/config/webui.json) 中的 `"port": 6099` |
+| **3001** | C++ 机器人（宿主机） | NapCat 容器 $\to$ 宿主机 `3001` | WebSocket 服务端，负责接收 QQ 消息事件并发送指令响应 | 源码 [src/main.cpp](file:///home/virtualself/Projects/qq-bot/src/main.cpp#L188) 中 `bot::core::WsServer server(ioc, 3001, "0.0.0.0");`。启动后可通过 `ss -tlnp \| grep 3001` 确认监听 |
+
+> [!NOTE]
+> **关于 `host.docker.internal`**：由于 NapCat 运行在 Docker 容器内，无法直接通过 `localhost` 访问宿主机上的服务。我们在 [docker-compose.yml](file:///home/virtualself/Projects/qq-bot/docker-compose.yml#L15-L16) 中配置了 `extra_hosts: "host.docker.internal:host-gateway"`，因此容器内填写的连接地址必须为 `ws://host.docker.internal:3001`。
+
+#### 4.2 查看 WebUI 访问 Token
+
+访问 NapCat WebUI 管理后台需要身份验证 Token。你可以通过以下任一方式获取：
+
+- **方式一（直接查看配置文件，推荐）**：
+  打开持久化配置文件 [napcat/config/webui.json](file:///home/virtualself/Projects/qq-bot/napcat/config/webui.json)，查看 `"token"` 字段的值：
+  ```bash
+  grep '"token"' napcat/config/webui.json
+  # 输出示例："token": "2e9c317e3022"
+  ```
+- **方式二（查看 Docker 容器日志）**：
+  容器启动时会在控制台打印登录 Token 与登录链接：
+  ```bash
+  docker logs napcat | grep -i token
+  ```
+
+#### 4.3 访问 WebUI 并扫码登录 QQ 账号
+
+1. **登录 WebUI 网站**：
+   - 本机浏览器访问：[http://localhost:6099/webui](http://localhost:6099/webui)（或 [http://127.0.0.1:6099/webui](http://127.0.0.1:6099/webui)）
+   - 远程服务器访问：`http://<服务器公网IP>:6099/webui`
+2. **输入身份凭证**：
+   - 在弹出的登录页面中输入 4.2 节获取的 **Token**，点击登录进入 NapCat 管理面板。
+3. **扫码登录 QQ 账号**：
+   - 进入「账号管理」或首页账号列表。
+   - 若已有预设账号（如 [docker-compose.yml](file:///home/virtualself/Projects/qq-bot/docker-compose.yml#L9) 中指定的 `ACCOUNT`），直接点击该账号卡片右侧的 **扫码登录** 或 **二维码** 图标；
+   - 若添加新账号，点击 **添加账号**，输入新 QQ 号后发起扫码；
+   - 使用手机 QQ 扫描网页上弹出的二维码，并在手机端点击确认登录。
+4. **备用命令行扫码方式**：
+   若不方便使用浏览器，也可以在终端直接查看二维码：
+   ```bash
+   docker logs -f napcat
+   ```
+   若终端字体错位导致无法扫码，复制日志中输出的 `二维码解码URL: https://txz.qq.com/...` 至浏览器或在线二维码生成工具中生成图片扫码即可。
+
+#### 4.4 新建与检查 OneBot 11 网络配置（WebSocket Client）
+
+登录 QQ 账号后，必须确保 NapCat 将消息推送到宿主机运行的 C++ 机器人：
+
+##### 途径 A：通过 WebUI 可视化新建网络配置
+1. 在 NapCat WebUI 左侧导航栏点击 **「网络配置」**。
+2. 找到当前已登录的 QQ 账号，点击 **「新建网络配置」** / **「添加配置」**。
+3. 选择配置类型：**WebSocket 客户端 (WebSocket Client)**。
+4. 填写网络参数：
+   - **配置名称**：`bot`（或自定义）
+   - **URL / 连接地址**：`ws://host.docker.internal:3001`
+   - **消息格式 (Message Post Format)**：选择 `array`（C++ 机器人端基于 Glaze 解析消息链，要求必须为 `array`）
+   - **启用连接 (Enable)**：勾选开启
+   - **心跳间隔 (Heart Interval)**：`5000` ms
+   - **重连间隔 (Reconnect Interval)**：`3000` ms
+5. 点击 **保存并应用**。
+
+##### 途径 B：通过本地 JSON 配置文件自动生效
+NapCat 在启动时会自动加载挂载目录下的 `napcat/config/onebot11_<QQ号>.json`。对于新账号，可直接基于模板复制：
+```bash
+cp napcat/config/onebot11_3809397604.json napcat/config/onebot11_<新QQ号>.json
+```
+标准配置模板 [onebot11_3809397604.json](file:///home/virtualself/Projects/qq-bot/napcat/config/onebot11_3809397604.json) 内容如下：
+```json
+{
+  "network": {
+    "httpServers": [],
+    "httpSseServers": [],
+    "httpClients": [],
+    "websocketServers": [],
+    "websocketClients": [
+      {
+        "enable": true,
+        "name": "bot",
+        "url": "ws://host.docker.internal:3001",
+        "reportSelfMessage": false,
+        "messagePostFormat": "array",
+        "token": "",
+        "debug": false,
+        "heartInterval": 5000,
+        "reconnectInterval": 3000,
+        "verifyCertificate": true
+      }
+    ]
+  }
+}
+```
+
+#### 4.5 账号掉线重登与异常排查
+
+1. **账号提示掉线**：
+   - 访问 WebUI（[http://localhost:6099/webui](http://localhost:6099/webui)），在账号列表点击重新扫码即可；
+   - 或者执行 `docker compose restart napcat` 后运行 `docker logs -f napcat` 扫码。
+   - 重登成功后 NapCat 会自动重连 C++ 机器人，**无需重启 `qq_bot`**。
+2. **清除残留会话与登录缓存**：
+   若因旧 Session 损坏或腾讯风控导致不断崩溃重启，可清空临时会话文件（配置不会丢失）：
+   ```bash
+   docker compose stop napcat
+   rm -rf napcat/qq/*
+   docker compose start napcat
+   ```
+
+---
+
+### 5. 启动机器人主程序
 
 ```bash
 ./build/Release/qq_bot
 ```
+
